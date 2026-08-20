@@ -1,80 +1,81 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo BestSpeech SAPI5 build
+rem Builds both architectures, stages output\ in the layout the installer
+rem expects, and compiles the installer.
+rem
+rem   build_all.bat            build everything and make the installer
+rem   build_all.bat noinstaller  build and stage only
+
+echo Infovox 230 SAPI5 build
 echo.
 
-set BUILD_DIR_X86=build_x86
-set BUILD_DIR_X64=build_x64
-set OUTPUT_DIR=output
+set "ROOT=%~dp0"
+set "BUILD_X86=%ROOT%build_x86"
+set "BUILD_X64=%ROOT%build_x64"
+set "STAGE=%ROOT%output"
+
+rem The worker keeps the engine dlls open, so it has to be gone before the
+rem staging step can replace them.
+taskkill /F /IM Infovox230Server.exe >nul 2>&1
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
-    echo ERROR: vswhere.exe not found. Install Visual Studio 2022 Build Tools or later.
+    echo ERROR: vswhere.exe not found. Install Visual Studio 2022 or the Build Tools.
     exit /b 1
 )
-
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-    set "VSINSTALLDIR=%%i"
-)
-
-if not defined VSINSTALLDIR (
-    echo ERROR: No Visual Studio installation with the C++ toolset was found.
+rem -products * so a Build Tools installation counts, not just a full Visual Studio.
+for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do set "VSDIR=%%i"
+if not defined VSDIR (
+    echo ERROR: no Visual Studio installation found.
     exit /b 1
 )
-
-echo Visual Studio: %VSINSTALLDIR%
+echo Visual Studio: %VSDIR%
 echo.
 
-echo === Building x86 ===
-cmake -A Win32 -S . -B %BUILD_DIR_X86% || exit /b 1
-cmake --build %BUILD_DIR_X86% --config Release || exit /b 1
+echo === 32-bit: SAPI5 engine, worker, diagnostics ===
+cmake -S "%ROOT%." -B "%BUILD_X86%" -A Win32 || exit /b 1
+cmake --build "%BUILD_X86%" --config Release || exit /b 1
 echo.
 
-echo === Building x64 ===
-cmake -A x64 -S . -B %BUILD_DIR_X64% || exit /b 1
-cmake --build %BUILD_DIR_X64% --config Release || exit /b 1
+echo === 64-bit: SAPI5 engine, diagnostics ===
+cmake -S "%ROOT%." -B "%BUILD_X64%" -A x64 || exit /b 1
+cmake --build "%BUILD_X64%" --config Release || exit /b 1
 echo.
 
-echo === Staging %OUTPUT_DIR% ===
-rem A worker left running by an earlier test holds output\BestspeechServer.exe open,
-rem which makes the copy below fail intermittently.
-taskkill /F /IM BestspeechServer.exe >nul 2>&1
+rem Documentation ships alongside the binaries.
+copy /Y "%ROOT%docs\README.txt" "%STAGE%\" >nul
+copy /Y "%ROOT%docs\voices.example.ini" "%STAGE%\" >nul
 
-if not exist %OUTPUT_DIR% mkdir %OUTPUT_DIR%
-if not exist %OUTPUT_DIR%\x64 mkdir %OUTPUT_DIR%\x64
-
-copy /Y "%BUILD_DIR_X86%\bin\Release\BestspeechSAPI.dll"   "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "%BUILD_DIR_X86%\bin\Release\BestspeechServer.exe" "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "bin\b32_wrapper.dll" "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "bin\b32_helper.exe"  "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "bin\b32_tts.dll"     "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "bin\dll_*.dll"       "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "%BUILD_DIR_X86%\bin\Release\BestSpeechDiagnostics.exe" "%OUTPUT_DIR%\" >nul || exit /b 1
-copy /Y "%BUILD_DIR_X64%\bin\Release\BestspeechSAPI.dll"   "%OUTPUT_DIR%\x64\" >nul || exit /b 1
-copy /Y "%BUILD_DIR_X64%\bin\Release\BestSpeechDiagnostics.exe" "%OUTPUT_DIR%\x64\" >nul || exit /b 1
+echo Staged in %STAGE%:
+dir /b "%STAGE%"
 echo.
 
-echo === Building installer ===
-set "ISCC="
-for %%p in (
-    "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
-    "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-    "%ProgramFiles%\Inno Setup 6\ISCC.exe"
-) do (
-    if not defined ISCC if exist %%p set "ISCC=%%~p"
-)
-
-if not defined ISCC (
-    echo WARNING: Inno Setup 6 not found; skipping installer.
-    echo          The staged files in %OUTPUT_DIR% are complete and usable.
+if /i "%~1"=="noinstaller" (
+    echo Skipping the installer.
     goto :done
 )
 
-"%ISCC%" /Q "installer\BestspeechSAPI.iss" || exit /b 1
+echo === installer ===
+set "ISCC="
+for %%p in (
+    "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+    "%ProgramFiles%\Inno Setup 6\ISCC.exe"
+    "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+) do if exist %%p set "ISCC=%%~p"
+
+if not defined ISCC (
+    echo Inno Setup 6 was not found, so the installer was not built.
+    echo Install it with:  winget install JRSoftware.InnoSetup
+    echo Then run:         build_all.bat
+    goto :done
+)
+
+"%ISCC%" "%ROOT%installer\Infovox230SAPI.iss" || exit /b 1
 echo.
+echo Installer: %STAGE%\Infovox230SAPI_Setup.exe
 
 :done
-echo Build finished.
-if exist "%OUTPUT_DIR%\BestSpeechSAPI_Setup.exe" echo Installer: %OUTPUT_DIR%\BestSpeechSAPI_Setup.exe
+echo.
+echo Build complete.
 endlocal

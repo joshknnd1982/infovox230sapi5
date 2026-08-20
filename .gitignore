@@ -3,9 +3,8 @@ build_x64
 build_x86
 output
 
-# Scratch audio from manual testing
-*.pcm
-*.wav
-
+# Generated: the voice samples (39 MB of wav) and probe scratch
+samples
+tools/_probe
 __pycache__/
 *.pyc
