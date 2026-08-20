@@ -1,6 +1,7 @@
 #include "pipe_client.h"
 #include <shlwapi.h>
 #include <cstring>
+#include "debug_log.h"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -81,8 +82,10 @@ bool PipeClient::launchServer() {
     }
 
     if (GetFileAttributesW(serverPath_.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DEBUG_LOG("pipe: worker not found at %ls", serverPath_.c_str());
         return false;
     }
+    DEBUG_LOG("pipe: launching worker %ls", serverPath_.c_str());
 
     HANDLE launchMutex = CreateMutexW(nullptr, FALSE, BESTSPEECH_LAUNCH_MUTEX);
     if (!launchMutex) {
@@ -135,6 +138,34 @@ bool PipeClient::connect() {
     return ensureConnected();
 }
 
+// A worker built against a different wire format must not be talked to. Old builds
+// answer PING with an empty payload, so a missing version is treated as a mismatch.
+bool PipeClient::handshakeOk() {
+    if (!sendCommand(CMD_PING)) {
+        return false;
+    }
+    PipeResponse resp;
+    std::vector<char> data;
+    if (!readResponse(resp, data) || resp != RESP_PONG || data.size() < sizeof(uint32_t)) {
+        return false;
+    }
+    return *reinterpret_cast<const uint32_t*>(data.data()) == BESTSPEECH_PROTOCOL_VERSION;
+}
+
+// Ask the mismatched worker to exit, wait for it to release its mutex, then start ours.
+bool PipeClient::replaceStaleServer() {
+    sendCommand(CMD_SHUTDOWN);
+    PipeResponse resp;
+    std::vector<char> data;
+    readResponse(resp, data);
+    disconnect();
+
+    for (int i = 0; i < 30 && isServerRunning(); ++i) {
+        Sleep(100);
+    }
+    return launchServer();
+}
+
 bool PipeClient::ensureConnected() {
     if (pipe_ != INVALID_HANDLE_VALUE) {
         return true;
@@ -150,7 +181,18 @@ bool PipeClient::ensureConnected() {
         if (pipe_ != INVALID_HANDLE_VALUE) {
             DWORD mode = PIPE_READMODE_BYTE;
             SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr);
-            return true;
+
+            if (handshakeOk()) {
+                return true;
+            }
+            // Left over from a previous version; replace it and connect to ours.
+            DEBUG_LOG("pipe: worker speaks a different protocol version, replacing it");
+            if (!replaceStaleServer()) {
+                DEBUG_LOG("pipe: could not replace the stale worker");
+                disconnect();
+                return false;
+            }
+            continue;
         }
 
         DWORD error = GetLastError();
@@ -168,24 +210,44 @@ bool PipeClient::ensureConnected() {
     return false;
 }
 
+bool PipeClient::writeAll(const void* data, uint32_t size) {
+    auto* p = static_cast<const char*>(data);
+    while (size > 0) {
+        DWORD written = 0;
+        if (!WriteFile(pipe_, p, size, &written, nullptr) || written == 0) {
+            return false;
+        }
+        p += written;
+        size -= written;
+    }
+    return true;
+}
+
+bool PipeClient::readAll(void* data, uint32_t size) {
+    auto* p = static_cast<char*>(data);
+    while (size > 0) {
+        DWORD got = 0;
+        if (!ReadFile(pipe_, p, size, &got, nullptr) || got == 0) {
+            return false;
+        }
+        p += got;
+        size -= got;
+    }
+    return true;
+}
+
 bool PipeClient::sendCommand(PipeCommand cmd, const void* data, uint32_t size) {
     if (pipe_ == INVALID_HANDLE_VALUE) {
         return false;
     }
 
     PipeMessageHeader header = { cmd, size };
-    DWORD written;
-
-    if (!WriteFile(pipe_, &header, sizeof(header), &written, nullptr)) {
+    if (!writeAll(&header, sizeof(header))) {
         return false;
     }
-
     if (data && size > 0) {
-        if (!WriteFile(pipe_, data, size, &written, nullptr)) {
-            return false;
-        }
+        return writeAll(data, size);
     }
-
     return true;
 }
 
@@ -195,10 +257,7 @@ bool PipeClient::readResponse(PipeResponse& resp, std::vector<char>& data) {
     }
 
     PipeMessageHeader header;
-    DWORD bytesRead;
-
-    if (!ReadFile(pipe_, &header, sizeof(header), &bytesRead, nullptr) ||
-        bytesRead != sizeof(header)) {
+    if (!readAll(&header, sizeof(header))) {
         return false;
     }
 
@@ -206,56 +265,51 @@ bool PipeClient::readResponse(PipeResponse& resp, std::vector<char>& data) {
     data.clear();
 
     if (header.size > 0) {
+        if (header.size > (16u << 20)) {
+            return false;
+        }
         data.resize(header.size);
-        if (!ReadFile(pipe_, data.data(), header.size, &bytesRead, nullptr) ||
-            bytesRead != header.size) {
+        if (!readAll(data.data(), header.size)) {
             return false;
         }
     }
     return true;
 }
 
-bool PipeClient::getVoices(std::vector<VoiceInfo>& voices) {
+uint32_t PipeClient::getSampleRate(int engineIndex) {
     CriticalLock lock(&cs_);
-    voices.clear();
 
-    if (!ensureConnected() || !sendCommand(CMD_GET_VOICES)) {
-        return false;
+    SampleRateQuery q{ engineIndex };
+    if (!ensureConnected() || !sendCommand(CMD_GET_SAMPLE_RATE, &q, sizeof(q))) {
+        disconnect();
+        return 0;
     }
 
     PipeResponse resp;
     std::vector<char> data;
-    if (!readResponse(resp, data) || resp != RESP_VOICES ||
-        data.size() < sizeof(VoicesResponse)) {
-        return false;
+    if (!readResponse(resp, data) || resp != RESP_SAMPLE_RATE || data.size() < sizeof(uint32_t)) {
+        return 0;
     }
-
-    const auto* vr = reinterpret_cast<const VoicesResponse*>(data.data());
-    const auto* vi = reinterpret_cast<const VoiceInfo*>(data.data() + sizeof(VoicesResponse));
-
-    for (uint32_t i = 0; i < vr->count; ++i) {
-        voices.push_back(vi[i]);
-    }
-
-    return true;
+    return *reinterpret_cast<const uint32_t*>(data.data());
 }
 
-bool PipeClient::speak(const char* text, int voiceIndex, int nativeRate, float sonicMultiplier,
-                       int gain, int frequency, PipeAudioCallback callback, void* user) {
+bool PipeClient::speak(const char* text, uint32_t textLength, int engineIndex,
+                       float sonicSpeed, float gainScale,
+                       PipeAudioCallback callback, void* user) {
     CriticalLock lock(&cs_);
 
-    auto textLen = static_cast<uint32_t>(strlen(text));
-    std::vector<char> payload(sizeof(SpeakCommand) + textLen);
+    std::vector<char> payload(sizeof(SpeakCommand) + textLength);
     auto* cmd = reinterpret_cast<SpeakCommand*>(payload.data());
-    cmd->voice_index = voiceIndex;
-    cmd->native_rate = nativeRate;
-    cmd->sonic_multiplier = sonicMultiplier;
-    cmd->gain = gain;
-    cmd->frequency = frequency;
-    cmd->text_length = textLen;
-    memcpy(payload.data() + sizeof(SpeakCommand), text, textLen);
+    cmd->engine_index = engineIndex;
+    cmd->sonic_speed = sonicSpeed;
+    cmd->gain_scale = gainScale;
+    cmd->text_length = textLength;
+    if (textLength > 0) {
+        memcpy(payload.data() + sizeof(SpeakCommand), text, textLength);
+    }
 
-    if (!ensureConnected() || !sendCommand(CMD_SPEAK, payload.data(), static_cast<uint32_t>(payload.size()))) {
+    if (!ensureConnected() ||
+        !sendCommand(CMD_SPEAK, payload.data(), static_cast<uint32_t>(payload.size()))) {
         disconnect();
         return false;
     }

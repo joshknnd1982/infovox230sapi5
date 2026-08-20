@@ -1,14 +1,17 @@
 #include <new>
 #include <string>
+#include <vector>
 #include <cmath>
 #include <algorithm>
+
 #include "utils.hpp"
+#include "text_pipeline.hpp"
 #include "ISpTTSEngineImpl.hpp"
 #include "debug_log.h"
+#include "helper_client.h"
 
-#ifdef BUILD_X64
 #include "pipe_client.h"
-#else
+#ifndef BUILD_X64
 #include "b32_wrapper.h"
 #endif
 
@@ -18,39 +21,129 @@ namespace sapi {
 namespace {
 
 constexpr WORD AUDIO_CHANNELS = 1;
-constexpr DWORD AUDIO_SAMPLE_RATE = 11025;
 constexpr WORD AUDIO_BITS_PER_SAMPLE = 16;
 
-constexpr int MIN_RATE = -10;
-constexpr int MAX_RATE = 10;
+// SAPI hands out rate, pitch and volume on these scales.
+constexpr int SAPI_RATE_MIN   = -10;
+constexpr int SAPI_RATE_MAX   =  10;
+constexpr int SAPI_PITCH_MIN  = -10;
+constexpr int SAPI_PITCH_MAX  =  10;
 
-constexpr int NATIVE_RATE_MIN = -100;
-constexpr int NATIVE_RATE_MAX = 100;
-
-constexpr int FREQ_MIN = 45;
-constexpr int FREQ_MAX = 400;
-
-constexpr int VOICE_DEFAULT_FREQS[] = {
-    80,
-    175,
-    65,
-    150,
-    90,
-    115,
-    230,
-    60,
-    60,
-    80,
-    47,
-    350,
-    300,
-    60
-};
-constexpr int VOICE_COUNT = sizeof(VOICE_DEFAULT_FREQS) / sizeof(VOICE_DEFAULT_FREQS[0]);
-
-#ifdef BUILD_X64
 PipeClient* g_pipeClient = nullptr;
-#endif
+
+// b32_helper.exe, resolved once from beside this dll.
+std::wstring helper_executable(const wchar_t* install_dir)
+{
+    return std::wstring(install_dir) + L"b32_helper.exe";
+}
+
+// Engines that produced nothing in process and have been moved onto the worker. One
+// flag per engine, set once and never cleared: if an engine is silent here it stays
+// silent, and every later utterance should take the path that works.
+volatile LONG g_worker_engines = 0;
+
+// The engine's measured response to its ~r command, as a speed factor relative to ~r0.
+// The documented "percentage of normal speed" only holds at the slow end; going fast the
+// engine compresses hard (~r-90 is 2.7x, nowhere near the 10x a naive reading suggests),
+// so both directions of this mapping follow the measured curve instead of a formula.
+struct rate_point { int param; float speed; };
+constexpr rate_point RATE_CURVE[] = {
+    { 200, 0.371f }, { 100, 0.539f }, { 0, 1.000f },
+    { -45, 1.660f }, { -61, 2.113f }, { -90, 2.711f },
+};
+constexpr int RATE_CURVE_COUNT = static_cast<int>(sizeof(RATE_CURVE) / sizeof(RATE_CURVE[0]));
+
+constexpr float RATE_SLOWEST = RATE_CURVE[0].speed;
+constexpr float RATE_FASTEST = RATE_CURVE[RATE_CURVE_COUNT - 1].speed;
+
+// Speed factor -> engine rate parameter, by interpolating the measured curve.
+[[nodiscard]] int speed_to_rate_param(float speed)
+{
+    if (speed <= RATE_SLOWEST) {
+        return RATE_CURVE[0].param;
+    }
+    if (speed >= RATE_FASTEST) {
+        return RATE_CURVE[RATE_CURVE_COUNT - 1].param;
+    }
+    for (int i = 0; i + 1 < RATE_CURVE_COUNT; ++i) {
+        const rate_point& a = RATE_CURVE[i];
+        const rate_point& b = RATE_CURVE[i + 1];
+        if (speed >= a.speed && speed <= b.speed) {
+            const float t = (speed - a.speed) / (b.speed - a.speed);
+            return static_cast<int>(std::lround(a.param + t * (b.param - a.param)));
+        }
+    }
+    return 0;
+}
+
+// SAPI rate -10..+10 spans a quarter speed to four times speed, which covers both a
+// beginner's pace and the very fast rates experienced screen reader users prefer.
+[[nodiscard]] float sapi_rate_to_speed(int sapi_rate)
+{
+    return std::pow(2.0f, static_cast<float>(std::clamp(sapi_rate, SAPI_RATE_MIN, SAPI_RATE_MAX)) / 5.0f);
+}
+
+[[nodiscard]] float sapi_pitch_to_factor(int sapi_pitch)
+{
+    return std::pow(2.0f, static_cast<float>(std::clamp(sapi_pitch, SAPI_PITCH_MIN, SAPI_PITCH_MAX)) / 10.0f);
+}
+
+// SAPI volume is a percentage of full loudness; the engine's gain command is in dB.
+[[nodiscard]] int volume_to_gain_db(unsigned short volume)
+{
+    if (volume == 0) {
+        return GAIN_MIN_DB;
+    }
+    const double db = 20.0 * std::log10(static_cast<double>(std::min<unsigned short>(volume, 100)) / 100.0);
+    return static_cast<int>(std::lround(db));
+}
+
+// Everything one fragment needs the engine to do, after the SAPI values have been
+// combined with the fragment's own adjustments and the engine's capabilities.
+struct synth_params {
+    std::wstring text;
+    int   native_rate = 0;
+    int   native_gain = 0;
+    float sonic_speed = 1.0f;
+    float gain_scale  = 1.0f;
+};
+
+[[nodiscard]] synth_params build_params(const engine_info& eng, const voice_info& voice,
+                                        int sapi_rate, int sapi_pitch, unsigned short volume)
+{
+    synth_params out;
+
+    const float wanted_speed = sapi_rate_to_speed(sapi_rate);
+    const float pitch_factor = sapi_pitch_to_factor(sapi_pitch);
+    const int gain_db = volume_to_gain_db(volume);
+
+    if (eng.commands == cmd_mode::none) {
+        // These frontends ignore inline commands completely, so rate goes through the
+        // shim's time stretcher and volume is applied to the samples. Pitch has nowhere
+        // to go on these three engines and is simply not available for them.
+        out.sonic_speed = wanted_speed;
+        out.gain_scale = static_cast<float>(
+            std::pow(10.0, (gain_db + eng.gain_trim_db) / 20.0));
+        return out;
+    }
+
+    // Prefer the engine's own rate control, which sounds better than time stretching,
+    // and only bring sonic in for speeds beyond what the engine can reach on its own.
+    out.native_rate = speed_to_rate_param(wanted_speed);
+    if (wanted_speed > RATE_FASTEST) {
+        out.sonic_speed = wanted_speed / RATE_FASTEST;
+    } else if (wanted_speed < RATE_SLOWEST) {
+        out.sonic_speed = wanted_speed / RATE_SLOWEST;
+    }
+
+    out.native_gain = std::clamp(gain_db + eng.gain_trim_db, GAIN_MIN_DB, GAIN_MAX_DB);
+
+    // Pitch reaches these engines as a frequency in the command prefix, which they
+    // render far more naturally than a pitch shifter would.
+    (void)voice;
+    (void)pitch_factor;
+    return out;
+}
 
 struct SpeakContext {
     ISpTTSEngineSite* caller = nullptr;
@@ -58,31 +151,11 @@ struct SpeakContext {
     bool aborted = false;
 };
 
-#ifdef BUILD_X64
-bool speak_callback(const char* data, uint32_t size, void* user) {
-#else
-bool speak_callback(const char* data, long size, void* user) {
-#endif
+bool write_to_site(const char* data, long size, void* user) {
     auto* ctx = static_cast<SpeakContext*>(user);
     if (!ctx || !ctx->caller) {
-        DEBUG_LOG("SAPI Callback: ERROR - No context or caller");
         return false;
     }
-
-    const DWORD actions = ctx->caller->GetActions();
-    if (actions & SPVES_ABORT) {
-        DEBUG_LOG("SAPI Callback: ABORT requested");
-        ctx->aborted = true;
-        return false;
-    }
-    if (actions & SPVES_SKIP) {
-        DEBUG_LOG("SAPI Callback: SKIP requested");
-        ctx->caller->CompleteSkip(0);
-        ctx->aborted = true;
-        return false;
-    }
-
-    DEBUG_LOG("SAPI Callback: Writing %ld bytes to SAPI", (long)size);
 
     auto ptr = reinterpret_cast<const BYTE*>(data);
     ULONG remaining = static_cast<ULONG>(size);
@@ -90,38 +163,71 @@ bool speak_callback(const char* data, long size, void* user) {
     while (remaining > 0) {
         const DWORD actions = ctx->caller->GetActions();
         if (actions & SPVES_ABORT) {
-            DEBUG_LOG("SAPI Callback: ABORT during write");
             ctx->aborted = true;
             return false;
         }
         if (actions & SPVES_SKIP) {
-            DEBUG_LOG("SAPI Callback: SKIP during write");
             ctx->caller->CompleteSkip(0);
             ctx->aborted = true;
             return false;
         }
 
-        ULONG written = remaining;
-        HRESULT hr = ctx->caller->Write(ptr, remaining, &written);
-        if (FAILED(hr)) {
-            DEBUG_LOG("SAPI Callback: Write FAILED with HRESULT 0x%08X", hr);
-            return false;
-        }
-        if (written > remaining) {
-            DEBUG_LOG("SAPI Callback: Write error - written (%lu) > remaining (%lu)", written, remaining);
+        ULONG written = 0;
+        const HRESULT hr = ctx->caller->Write(ptr, remaining, &written);
+        if (FAILED(hr) || written == 0 || written > remaining) {
+            DEBUG_LOG("SAPI Write failed: hr=0x%08X written=%lu remaining=%lu", hr, written, remaining);
             return false;
         }
         ctx->bytes_written += written;
         remaining -= written;
         ptr += written;
     }
-
-    DEBUG_LOG("SAPI Callback: Successfully wrote %ld bytes", (long)size);
     return true;
 }
+
+// The in-process engine reports sizes as long, the worker as uint32_t; both end up here.
+bool speak_callback(const char* data, long size, void* user) {
+    return write_to_site(data, size, user);
 }
 
-#ifdef BUILD_X64
+bool pipe_callback(const char* data, uint32_t size, void* user) {
+    return write_to_site(data, static_cast<long>(size), user);
+}
+
+void add_event(ISpTTSEngineSite* site, SPEVENTENUM id, ULONGLONG offset,
+               WPARAM wparam, LPARAM lparam, SPEVENTLPARAMTYPE ltype)
+{
+    SPEVENT ev = {};
+    ev.eEventId = id;
+    ev.elParamType = ltype;
+    ev.ullAudioStreamOffset = offset;
+    ev.ulStreamNum = 0;
+    ev.wParam = wparam;
+    ev.lParam = lparam;
+    site->AddEvents(&ev, 1);
+}
+
+// Writes a run of silence straight to SAPI, for SPVA_Silence fragments.
+void write_silence(SpeakContext& ctx, DWORD sample_rate, ULONG msecs)
+{
+    if (msecs == 0) {
+        return;
+    }
+    const size_t samples = static_cast<size_t>(sample_rate) * msecs / 1000u;
+    std::vector<short> zeros(std::min<size_t>(samples, 4096), 0);
+    size_t remaining = samples;
+    while (remaining > 0 && !ctx.aborted) {
+        const size_t chunk = std::min(remaining, zeros.size());
+        if (!speak_callback(reinterpret_cast<const char*>(zeros.data()),
+                            static_cast<long>(chunk * 2), &ctx)) {
+            break;
+        }
+        remaining -= chunk;
+    }
+}
+
+}  // namespace
+
 void InitPipeClient()
 {
     if (!g_pipeClient) {
@@ -141,94 +247,285 @@ void ShutdownPipeServer()
         g_pipeClient->shutdownServer();
     }
 }
-#endif
 
-ISpTTSEngineImpl::ISpTTSEngineImpl()
-    : voice_index_(0)
+// Engines the user has pinned to the worker by hand, read once per process:
+//   HKCU\Software\BestSpeech  REG_SZ  WorkerEngines = "por,rus"   (or "*" for all)
+// The automatic fallback below covers this on its own, but a pinned engine never has to
+// waste a first silent utterance discovering that it needs the worker.
+LONG configured_worker_engines()
 {
+    static LONG cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    cached = 0;
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\BestSpeech", 0, KEY_READ, &key)
+        == ERROR_SUCCESS) {
+        wchar_t value[256] = {};
+        DWORD size = sizeof(value);
+        DWORD type = 0;
+        if (RegQueryValueExW(key, L"WorkerEngines", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(value), &size) == ERROR_SUCCESS &&
+            type == REG_SZ) {
+            const std::wstring list = value;
+            if (list == L"*") {
+                cached = ~0L;
+            } else {
+                for (int i = 0; i < engine_count && i < 32; ++i) {
+                    std::wstring id;
+                    for (const char* c = engines[i].id; *c; ++c) {
+                        id += static_cast<wchar_t>(*c);
+                    }
+                    if (list.find(id) != std::wstring::npos) {
+                        cached |= (1L << i);
+                    }
+                }
+            }
+        }
+        RegCloseKey(key);
+    }
+    if (cached != 0) {
+        DEBUG_LOG("Engines pinned to the worker by configuration: 0x%08lX", cached);
+    }
+    return cached;
 }
 
+bool ISpTTSEngineImpl::engine_needs_worker(int engine_index)
+{
+    if (engine_index < 0 || engine_index >= 32) {
+        return false;
+    }
+    const LONG mask = InterlockedCompareExchange(&g_worker_engines, 0, 0)
+                    | configured_worker_engines();
+    return (mask & (1L << engine_index)) != 0;
+}
+
+void ISpTTSEngineImpl::mark_engine_needs_worker(int engine_index)
+{
+    if (engine_index < 0 || engine_index >= 32) {
+        return;
+    }
+    LONG previous, updated;
+    do {
+        previous = InterlockedCompareExchange(&g_worker_engines, 0, 0);
+        updated = previous | (1L << engine_index);
+    } while (InterlockedCompareExchange(&g_worker_engines, updated, previous) != previous);
+}
+
+ISpTTSEngineImpl::ISpTTSEngineImpl() = default;
 ISpTTSEngineImpl::~ISpTTSEngineImpl() = default;
+
+namespace {
+// The engine dlls, the shim and the helper all sit beside this dll.
+bool install_directory(wchar_t* out, DWORD size)
+{
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&install_directory), &self)) {
+        return false;
+    }
+    if (!GetModuleFileNameW(self, out, size)) {
+        return false;
+    }
+    wchar_t* last_slash = wcsrchr(out, L'\\');
+    if (!last_slash) {
+        return false;
+    }
+    *(last_slash + 1) = L'\0';
+
+    // The 64-bit engine is installed one level down, in an x64 subfolder, while the
+    // engine dlls, the shim and b32_helper.exe all sit beside the 32-bit build. If the
+    // helper is not here, the runtime files are in the parent directory.
+    std::wstring probe = std::wstring(out) + L"b32_helper.exe";
+    if (GetFileAttributesW(probe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        *last_slash = L'\0';                 // drop the trailing separator
+        if (wchar_t* parent = wcsrchr(out, L'\\')) {
+            *(parent + 1) = L'\0';
+        } else {
+            *last_slash = L'\\';             // nothing above it; put it back
+            *(last_slash + 1) = L'\0';
+        }
+    }
+    return true;
+}
+}
+
+bool ISpTTSEngineImpl::ensure_helper_started()
+{
+    const int wanted = voice_.get_engine_index();
+    if (helper_.running() && helper_engine_ == wanted) {
+        return true;
+    }
+
+    wchar_t dir[MAX_PATH] = {};
+    if (!install_directory(dir, MAX_PATH)) {
+        return false;
+    }
+
+    const std::wstring engine_dll = std::wstring(dir) + voice_.engine().dll;
+    if (!helper_.start(helper_executable(dir), engine_dll)) {
+        DEBUG_LOG("Could not start a helper for engine %s", voice_.engine().id);
+        helper_engine_ = -1;
+        return false;
+    }
+    helper_engine_ = wanted;
+    return true;
+}
+
+#ifndef BUILD_X64
+namespace {
+long g_probe_bytes = 0;
+bool probe_sink(const char*, long n, void*) { g_probe_bytes += n; return true; }
+}
+
+// A short utterance whose audio is thrown away, used only to tell a working engine from
+// one that will silently produce nothing.
+bool ISpTTSEngineImpl::probe_engine_output()
+{
+    const engine_info& eng = voice_.engine();
+
+    std::wstring probe = text::command_prefix(eng, voices[0], 0, voices[0].pitch, 0);
+    probe += L"a";
+    if (eng.commands != cmd_mode::none) {
+        probe += L" ~|";
+    }
+    const std::string encoded = text::encode(probe, eng);
+
+    b32::SpeakParams params;
+    params.text = encoded.c_str();
+
+    g_probe_bytes = 0;
+    b32::speak_async(bst_state_.get(), probe_sink, nullptr, params);
+    return g_probe_bytes > 0;
+}
+
+bool ISpTTSEngineImpl::ensure_engine_loaded()
+{
+    const int wanted = voice_.get_engine_index();
+    const DWORD thread = GetCurrentThreadId();
+
+    // The shim hooks winmm to capture what the engine plays, and that hook state is per
+    // thread: an engine opened on one thread produces nothing at all when synthesized
+    // from another, with no error anywhere. SAPI is free to move work between threads,
+    // so the engine is reopened whenever the calling thread changes.
+    if (bst_state_ && loaded_engine_ == wanted && loaded_thread_ == thread) {
+        return true;
+    }
+    if (bst_state_ && loaded_engine_ == wanted && loaded_thread_ != thread) {
+        DEBUG_LOG("Engine %s was opened on thread %lu but is being driven from %lu; reopening",
+                  voice_.engine().id, loaded_thread_, thread);
+    }
+
+    bst_state_.reset();
+    loaded_engine_ = -1;
+    loaded_thread_ = 0;
+
+    wchar_t dll_path[MAX_PATH] = {};
+    if (!install_directory(dll_path, MAX_PATH)) {
+        return false;
+    }
+
+    if (!b32::load_shim(dll_path)) {
+        DEBUG_LOG("FAILED to load b32_wrapper.dll from %ls (error %lu) -- no voice can "
+                  "speak in process without it", dll_path, GetLastError());
+        return false;
+    }
+
+    std::wstring path = dll_path;
+    path += voice_.engine().dll;
+
+    bst_state_ = b32::init(path.c_str());
+    if (!bst_state_) {
+        const DWORD err = GetLastError();
+        const bool present = GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+        DEBUG_LOG("FAILED to open engine %s: %ls (file %s, last error %lu) -- this voice "
+                  "will be listed but silent",
+                  voice_.engine().id, path.c_str(),
+                  present ? "exists" : "IS MISSING", err);
+        return false;
+    }
+    loaded_engine_ = wanted;
+    loaded_thread_ = thread;
+    DEBUG_LOG("Loaded engine %s from %ls on thread %lu (sample rate %lu, v2=%d)",
+              voice_.engine().id, path.c_str(), thread,
+              b32::get_sample_rate(bst_state_.get()), (int)b32::is_v2(bst_state_.get()));
+
+    // Prove the engine can actually synthesize before trusting it with real speech.
+    // Some engines load cleanly and then return nothing at all when driven in process
+    // inside a host application; catching that here means the very first thing the user
+    // asks for already goes to the worker, instead of being lost while we find out.
+    if (!probe_engine_output()) {
+        DEBUG_LOG("Engine %s loaded but produced no audio when probed; using the worker "
+                  "for it from now on", voice_.engine().id);
+        mark_engine_needs_worker(wanted);
+        bst_state_.reset();
+        loaded_engine_ = -1;
+        return false;
+    }
+    return true;
+}
+#endif
 
 STDMETHODIMP ISpTTSEngineImpl::SetObjectToken(ISpObjectToken* pToken)
 {
-    DEBUG_LOG("=== SetObjectToken Called ===");
-
     if (!pToken) {
-        DEBUG_LOG("SetObjectToken: ERROR - pToken is NULL");
         return E_INVALIDARG;
     }
 
     try {
         ISpDataKeyPtr attr;
         if (FAILED(pToken->OpenKey(L"Attributes", &attr))) {
-            DEBUG_LOG("SetObjectToken: ERROR - Failed to open Attributes key");
             return E_INVALIDARG;
         }
 
-        utils::out_ptr<wchar_t> name(CoTaskMemFree);
-        if (FAILED(attr->GetStringValue(L"Name", name.address()))) {
-            DEBUG_LOG("SetObjectToken: ERROR - Failed to get Name attribute");
-            return E_INVALIDARG;
-        }
+        // The token carries the engine id and voice index directly, so the exact voice
+        // is recovered without having to parse a localized display name back apart.
+        int engine_index = 0;
+        int voice_index = 0;
 
-        const std::string voice_name = utils::wstring_to_string(name.get());
-        DEBUG_LOG("SetObjectToken: Voice name = %s", voice_name.c_str());
-        voice_index_ = 0;
-
-#ifdef BUILD_X64
-        if (g_pipeClient) {
-            std::vector<VoiceInfo> voices;
-            if (g_pipeClient->getVoices(voices)) {
-                for (size_t i = 0; i < voices.size(); ++i) {
-                    if (_stricmp(voices[i].name, voice_name.c_str()) == 0) {
-                        voice_index_ = static_cast<int>(i);
-                        break;
-                    }
-                }
+        utils::out_ptr<wchar_t> engine_id(CoTaskMemFree);
+        if (SUCCEEDED(attr->GetStringValue(L"BstEngine", engine_id.address())) && engine_id.get()) {
+            engine_index = engine_by_id(utils::wstring_to_string(engine_id.get()).c_str());
+            if (engine_index < 0) {
+                engine_index = 0;
             }
         }
-#else
-        for (int i = 0; i < bst_voice_count; ++i) {
-            if (_stricmp(bst_voices[i].name, voice_name.c_str()) == 0) {
-                voice_index_ = i;
-                break;
-            }
-        }
-#endif
 
+        utils::out_ptr<wchar_t> voice_id(CoTaskMemFree);
+        if (SUCCEEDED(attr->GetStringValue(L"BstVoice", voice_id.address())) && voice_id.get()) {
+            voice_index = _wtoi(voice_id.get());
+        }
+
+        voice_ = voice_attributes(engine_index, voice_index);
         token_ = pToken;
-        DEBUG_LOG("SetObjectToken: SUCCESS - Voice index = %d", voice_index_);
+
+        DEBUG_LOG("SetObjectToken: engine=%s voice=%d", voice_.engine().id, voice_.get_voice_index());
         return S_OK;
     }
     catch (const std::bad_alloc&) {
-        DEBUG_LOG("SetObjectToken: ERROR - Out of memory");
         return E_OUTOFMEMORY;
     }
     catch (...) {
-        DEBUG_LOG("SetObjectToken: ERROR - Unexpected exception");
         return E_UNEXPECTED;
     }
 }
 
 STDMETHODIMP ISpTTSEngineImpl::GetObjectToken(ISpObjectToken** ppToken)
 {
-    DEBUG_LOG("=== GetObjectToken Called ===");
-
     if (!ppToken) {
-        DEBUG_LOG("GetObjectToken: ERROR - ppToken is NULL");
         return E_POINTER;
     }
     *ppToken = nullptr;
 
-    if (token_) {
-        token_.AddRef();
-        *ppToken = token_.GetInterfacePtr();
-        DEBUG_LOG("GetObjectToken: SUCCESS - Returned token");
-        return S_OK;
+    if (!token_) {
+        return E_UNEXPECTED;
     }
-    DEBUG_LOG("GetObjectToken: ERROR - No token set");
-    return E_UNEXPECTED;
+    token_.AddRef();
+    *ppToken = token_.GetInterfacePtr();
+    return S_OK;
 }
 
 STDMETHODIMP ISpTTSEngineImpl::GetOutputFormat(
@@ -237,14 +534,7 @@ STDMETHODIMP ISpTTSEngineImpl::GetOutputFormat(
     GUID* pOutputFormatId,
     WAVEFORMATEX** ppCoMemOutputWaveFormatEx)
 {
-    DEBUG_LOG("=== GetOutputFormat Called ===");
-
-    if (!pOutputFormatId) {
-        DEBUG_LOG("GetOutputFormat: ERROR - pOutputFormatId is NULL");
-        return E_POINTER;
-    }
-    if (!ppCoMemOutputWaveFormatEx) {
-        DEBUG_LOG("GetOutputFormat: ERROR - ppCoMemOutputWaveFormatEx is NULL");
+    if (!pOutputFormatId || !ppCoMemOutputWaveFormatEx) {
         return E_POINTER;
     }
 
@@ -253,40 +543,33 @@ STDMETHODIMP ISpTTSEngineImpl::GetOutputFormat(
 
     auto* pwfex = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
     if (!pwfex) {
-        DEBUG_LOG("GetOutputFormat: ERROR - Out of memory");
         return E_OUTOFMEMORY;
     }
 
+    // Declared from the table rather than by loading the engine here: the shim keeps
+    // its audio-capture state per thread, and SAPI does not promise that GetOutputFormat
+    // and Speak run on the same one. Opening the engine on this thread could bind it to
+    // a thread that never synthesizes, which is silence.
     pwfex->wFormatTag = WAVE_FORMAT_PCM;
     pwfex->nChannels = AUDIO_CHANNELS;
-    pwfex->nSamplesPerSec = AUDIO_SAMPLE_RATE;
+    pwfex->nSamplesPerSec = voice_.engine().sample_rate;
     pwfex->wBitsPerSample = AUDIO_BITS_PER_SAMPLE;
-    pwfex->nBlockAlign = pwfex->nChannels * pwfex->wBitsPerSample / 8;
+    pwfex->nBlockAlign = static_cast<WORD>(pwfex->nChannels * pwfex->wBitsPerSample / 8);
     pwfex->nAvgBytesPerSec = pwfex->nSamplesPerSec * pwfex->nBlockAlign;
     pwfex->cbSize = 0;
 
     *ppCoMemOutputWaveFormatEx = pwfex;
-    DEBUG_LOG("GetOutputFormat: SUCCESS - Channels=%d, Rate=%lu, Bits=%d",
-              pwfex->nChannels, pwfex->nSamplesPerSec, pwfex->wBitsPerSample);
     return S_OK;
 }
 
 STDMETHODIMP ISpTTSEngineImpl::Speak(
-    DWORD dwSpeakFlags,
+    DWORD /*dwSpeakFlags*/,
     REFGUID /*rguidFormatId*/,
     const WAVEFORMATEX* /*pWaveFormatEx*/,
     const SPVTEXTFRAG* pTextFragList,
     ISpTTSEngineSite* pOutputSite)
 {
-    DEBUG_LOG("=== Speak Called ===");
-    DEBUG_LOG("Speak Flags: 0x%08X", dwSpeakFlags);
-
-    if (!pTextFragList) {
-        DEBUG_LOG("Speak: ERROR - pTextFragList is NULL");
-        return E_INVALIDARG;
-    }
-    if (!pOutputSite) {
-        DEBUG_LOG("Speak: ERROR - pOutputSite is NULL");
+    if (!pTextFragList || !pOutputSite) {
         return E_INVALIDARG;
     }
 
@@ -297,66 +580,28 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
 #endif
 
     try {
-#ifndef BUILD_X64
-        if (!bst_state_) {
-            wchar_t dll_path[MAX_PATH];
-            HMODULE hm = nullptr;
-
-            if (GetModuleHandleExW(
-                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    reinterpret_cast<LPCWSTR>(&speak_callback), &hm)) {
-                GetModuleFileNameW(hm, dll_path, MAX_PATH);
-                wchar_t* last_slash = wcsrchr(dll_path, L'\\');
-                if (last_slash) {
-                    wcscpy_s(last_slash + 1, MAX_PATH - (last_slash - dll_path + 1), L"b32_tts.dll");
-                    bst_state_ = b32::init(dll_path);
-                }
-            }
-
-            if (!bst_state_) {
-                bst_state_ = b32::init(static_cast<const char*>(nullptr));
-            }
-
-            if (!bst_state_) {
-                return E_FAIL;
-            }
-        }
-#endif
+        const engine_info& eng = voice_.engine();
+        const voice_info& voice = voice_.voice();
 
         long sapi_rate = 0;
         pOutputSite->GetRate(&sapi_rate);
 
         unsigned short sapi_volume = 100;
         pOutputSite->GetVolume(&sapi_volume);
-        int gain = static_cast<int>((sapi_volume - 100) * 0.5);
-
-        DEBUG_LOG("=== New Speech Request ===");
-        DEBUG_LOG("Voice Index: %d", voice_index_);
-        DEBUG_LOG("SAPI Rate: %d, SAPI Volume: %u (Gain: %d)", (int)sapi_rate, sapi_volume, gain);
 
         ULONGLONG event_interest = 0;
         pOutputSite->GetEventInterest(&event_interest);
-        const bool send_sentence_events = (event_interest & (1ULL << SPEI_SENTENCE_BOUNDARY)) != 0;
-        const bool send_word_events = (event_interest & (1ULL << SPEI_WORD_BOUNDARY)) != 0;
-        DEBUG_LOG("Event interest: 0x%llX (sentence: %d, word: %d)", event_interest, send_sentence_events, send_word_events);
+        const bool want_sentence = (event_interest & SPFEI(SPEI_SENTENCE_BOUNDARY)) != 0;
+        const bool want_word = (event_interest & SPFEI(SPEI_WORD_BOUNDARY)) != 0;
+
+        DEBUG_LOG("=== Speak: engine=%s voice=%ls, SAPI rate=%d volume=%u ===",
+                  eng.id, voice.name, static_cast<int>(sapi_rate), sapi_volume);
 
         SpeakContext ctx;
         ctx.caller = pOutputSite;
-        ctx.bytes_written = 0;
-        ctx.aborted = false;
 
-        int frag_count = 0;
-        for (const SPVTEXTFRAG* f = pTextFragList; f; f = f->pNext) {
-            frag_count++;
-        }
-        DEBUG_LOG("Fragment count: %d", frag_count);
-
-        int frag_num = 0;
         for (const SPVTEXTFRAG* frag = pTextFragList; frag; frag = frag->pNext) {
-            frag_num++;
-            DEBUG_LOG("--- Processing Fragment %d/%d ---", frag_num, frag_count);
             const DWORD actions = pOutputSite->GetActions();
-
             if (actions & SPVES_ABORT) {
                 break;
             }
@@ -364,232 +609,173 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
                 pOutputSite->CompleteSkip(0);
                 break;
             }
-
+            // Rate and volume can be changed while an utterance is already playing.
             if (actions & SPVES_RATE) {
                 pOutputSite->GetRate(&sapi_rate);
             }
             if (actions & SPVES_VOLUME) {
                 pOutputSite->GetVolume(&sapi_volume);
-                gain = static_cast<int>((sapi_volume - 100) * 0.5);
             }
 
-            DEBUG_LOG("Fragment eAction: %d (SPVA_Speak=0, SPVA_Silence=1, SPVA_Pronounce=2, SPVA_Bookmark=3, SPVA_SpellOut=4)",
-                      frag->State.eAction);
-            DEBUG_LOG("Fragment ulTextSrcOffset: %lu, ulTextLen: %lu", frag->ulTextSrcOffset, frag->ulTextLen);
-
             if (frag->State.eAction == SPVA_Bookmark) {
-                DEBUG_LOG("Fragment is a BOOKMARK");
-                if (frag->ulTextLen > 0 && frag->pTextStart) {
-                    std::wstring bookmark_text(frag->pTextStart, frag->ulTextLen);
-                    DEBUG_LOG("Bookmark text: \"%S\"", bookmark_text.c_str());
+                const std::wstring mark = (frag->ulTextLen && frag->pTextStart)
+                    ? std::wstring(frag->pTextStart, frag->ulTextLen) : std::wstring();
+                long id = 0;
+                if (!mark.empty()) {
+                    id = _wtol(mark.c_str());
+                }
+                add_event(pOutputSite, SPEI_TTS_BOOKMARK, ctx.bytes_written,
+                          static_cast<WPARAM>(id),
+                          reinterpret_cast<LPARAM>(mark.c_str()),
+                          mark.empty() ? SPET_LPARAM_IS_UNDEFINED : SPET_LPARAM_IS_STRING);
+                continue;
+            }
 
-                    long bookmark_id = 0;
-                    try {
-                        bookmark_id = std::stol(bookmark_text);
-                    } catch (...) {
-                    }
-
-                    SPEVENT event = {};
-                    event.eEventId = SPEI_TTS_BOOKMARK;
-                    event.elParamType = SPET_LPARAM_IS_STRING;
-                    event.ullAudioStreamOffset = ctx.bytes_written;
-                    event.ulStreamNum = 0;
-                    event.lParam = reinterpret_cast<LPARAM>(bookmark_text.c_str());
-                    event.wParam = bookmark_id;
-                    HRESULT hr = pOutputSite->AddEvents(&event, 1);
-                    DEBUG_LOG("SAPI Event: Bookmark at byte offset %llu, id=%ld, text=\"%S\" - Result: 0x%08X",
-                              ctx.bytes_written, bookmark_id, bookmark_text.c_str(), hr);
-                } else {
-                    DEBUG_LOG("Bookmark has no text, sending with id=0");
-                    SPEVENT event = {};
-                    event.eEventId = SPEI_TTS_BOOKMARK;
-                    event.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                    event.ullAudioStreamOffset = ctx.bytes_written;
-                    event.ulStreamNum = 0;
-                    event.lParam = 0;
-                    event.wParam = 0;
-                    HRESULT hr = pOutputSite->AddEvents(&event, 1);
-                    DEBUG_LOG("SAPI Event: Bookmark (empty) at byte offset %llu - Result: 0x%08X",
-                              ctx.bytes_written, hr);
+            if (frag->State.eAction == SPVA_Silence) {
+                write_silence(ctx, eng.sample_rate, frag->State.SilenceMSecs);
+                if (ctx.aborted) {
+                    break;
                 }
                 continue;
             }
 
-            if (frag->State.eAction != SPVA_Speak && frag->State.eAction != SPVA_SpellOut) {
-                DEBUG_LOG("Fragment skipped - not Speak or SpellOut action");
+            // SPVA_Pronounce carries a phoneme string this engine has no way to honour,
+            // so its text is spoken normally rather than dropped.
+            if (frag->State.eAction != SPVA_Speak &&
+                frag->State.eAction != SPVA_SpellOut &&
+                frag->State.eAction != SPVA_Pronounce) {
                 continue;
             }
-
             if (frag->ulTextLen == 0 || !frag->pTextStart) {
-                DEBUG_LOG("Fragment skipped - no text");
                 continue;
             }
 
-            const std::string text = utils::wstring_to_string(frag->pTextStart, frag->ulTextLen);
-            DEBUG_LOG("Fragment text: \"%s\"", text.c_str());
-            if (text.empty()) {
-                DEBUG_LOG("Fragment skipped - empty after conversion");
-                continue;
+            const std::wstring raw(frag->pTextStart, frag->ulTextLen);
+
+            if (want_sentence) {
+                add_event(pOutputSite, SPEI_SENTENCE_BOUNDARY, ctx.bytes_written,
+                          frag->ulTextLen, frag->ulTextSrcOffset, SPET_LPARAM_IS_UNDEFINED);
             }
-
-            if (send_sentence_events) {
-                SPEVENT event = {};
-                event.eEventId = SPEI_SENTENCE_BOUNDARY;
-                event.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                event.ullAudioStreamOffset = ctx.bytes_written;
-                event.ulStreamNum = 0;
-                event.lParam = frag->ulTextSrcOffset;
-                event.wParam = frag->ulTextLen;
-                HRESULT hr = pOutputSite->AddEvents(&event, 1);
-                DEBUG_LOG("SAPI Event: Sentence boundary at byte offset %llu, position %lu, length %lu - Result: 0x%08X",
-                          ctx.bytes_written, frag->ulTextSrcOffset, frag->ulTextLen, hr);
-            }
-
-            if (send_word_events) {
-                const wchar_t* text_start = frag->pTextStart;
-                ULONG text_len = frag->ulTextLen;
-
+            if (want_word) {
                 bool in_word = false;
                 ULONG word_start = 0;
-
-                for (ULONG i = 0; i <= text_len; ++i) {
-                    bool is_word_char = (i < text_len) &&
-                                       (iswalnum(text_start[i]) || text_start[i] == L'\'' || text_start[i] == L'-');
-
-                    if (is_word_char && !in_word) {
+                for (ULONG i = 0; i <= frag->ulTextLen; ++i) {
+                    const bool word_char = (i < frag->ulTextLen) &&
+                        (iswalnum(raw[i]) || raw[i] == L'\'' || raw[i] == L'-');
+                    if (word_char && !in_word) {
                         word_start = i;
                         in_word = true;
-                    } else if (!is_word_char && in_word) {
-                        ULONG word_len = i - word_start;
-                        SPEVENT event = {};
-                        event.eEventId = SPEI_WORD_BOUNDARY;
-                        event.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                        event.ullAudioStreamOffset = ctx.bytes_written;
-                        event.ulStreamNum = 0;
-                        event.lParam = frag->ulTextSrcOffset + word_start;
-                        event.wParam = word_len;
-                        HRESULT hr = pOutputSite->AddEvents(&event, 1);
-
-                        std::wstring word_text(text_start + word_start, word_len);
-                        DEBUG_LOG("SAPI Event: Word boundary at byte offset %llu, position %lu, length %lu (\"%S\") - Result: 0x%08X",
-                                  ctx.bytes_written, frag->ulTextSrcOffset + word_start, word_len,
-                                  word_text.c_str(), hr);
-
+                    } else if (!word_char && in_word) {
+                        add_event(pOutputSite, SPEI_WORD_BOUNDARY, ctx.bytes_written,
+                                  i - word_start, frag->ulTextSrcOffset + word_start,
+                                  SPET_LPARAM_IS_UNDEFINED);
                         in_word = false;
                     }
                 }
             }
 
-            int combined_rate = static_cast<int>(sapi_rate) + frag->State.RateAdj;
-            combined_rate = std::clamp(combined_rate, MIN_RATE, MAX_RATE);
+            // Fragment adjustments ride on top of the stream-wide settings.
+            const int frag_rate = std::clamp<int>(static_cast<int>(sapi_rate) + frag->State.RateAdj,
+                                                 SAPI_RATE_MIN, SAPI_RATE_MAX);
+            const int frag_pitch = std::clamp<int>(static_cast<int>(frag->State.PitchAdj.MiddleAdj),
+                                                  SAPI_PITCH_MIN, SAPI_PITCH_MAX);
+            const unsigned short frag_volume = static_cast<unsigned short>(
+                std::clamp<int>(sapi_volume * frag->State.Volume / 100, 0, 100));
 
-            DEBUG_LOG("--- Rate Calculation ---");
-            DEBUG_LOG("  RateAdj: %d, Combined Rate: %d", frag->State.RateAdj, combined_rate);
+            synth_params sp = build_params(eng, voice, frag_rate, frag_pitch, frag_volume);
 
-            const float speed_multiplier = std::pow(2.0f, static_cast<float>(combined_rate) / 8.0f);
-
-            DEBUG_LOG("  Speed Multiplier: %.2fx (2^(rate/8))", speed_multiplier);
-
-            int native_rate = 0;
-            float sonic_multiplier = 1.0f;
-
-            float desired_native_rate = -100.0f * std::log2(speed_multiplier);
-
-            if (desired_native_rate > NATIVE_RATE_MAX) {
-                native_rate = NATIVE_RATE_MAX;
-                sonic_multiplier = speed_multiplier / 0.5f;
-                DEBUG_LOG("  Mode: VERY SLOW - Native rate maxed at +%d, using Sonic %.2fx", native_rate, sonic_multiplier);
-            } else if (desired_native_rate < NATIVE_RATE_MIN) {
-                native_rate = NATIVE_RATE_MIN;
-                sonic_multiplier = speed_multiplier / 2.0f;
-                DEBUG_LOG("  Mode: VERY FAST - Native rate maxed at %d, using Sonic %.2fx", native_rate, sonic_multiplier);
-            } else {
-                native_rate = static_cast<int>(std::round(desired_native_rate));
-                sonic_multiplier = 1.0f;
-                DEBUG_LOG("  Mode: NORMAL - Using Native Rate Only (No Sonic)");
-                DEBUG_LOG("  Native Rate: %d", native_rate);
+            const std::wstring body = (frag->State.eAction == SPVA_SpellOut)
+                ? text::prepare_spelled(raw, eng)
+                : text::prepare(raw, eng);
+            if (body.empty()) {
+                continue;
             }
 
-            const int frag_gain = gain + static_cast<int>((frag->State.Volume - 100) * 0.5);
+            // Pitch reaches the tilde engines as a frequency, which they render far more
+            // naturally than a pitch shifter could.
+            const int pitch_hz = std::clamp(
+                static_cast<int>(std::lround(voice.pitch * sapi_pitch_to_factor(frag_pitch))),
+                PITCH_MIN_HZ, PITCH_MAX_HZ);
 
-            int default_freq = 100;
-            if (voice_index_ >= 0 && voice_index_ < VOICE_COUNT) {
-                default_freq = VOICE_DEFAULT_FREQS[voice_index_];
+            std::wstring full = text::command_prefix(eng, voice, sp.native_rate,
+                                                     pitch_hz, sp.native_gain);
+            full += body;
+            if (eng.commands != cmd_mode::none) {
+                full += L" ~|";  // flush the engine's phrase buffer
             }
 
-            DEBUG_LOG("--- Pitch Calculation ---");
-            DEBUG_LOG("  Voice Default Frequency: %d Hz", default_freq);
-
-            const int pitch_val = frag->State.PitchAdj.MiddleAdj;
-            DEBUG_LOG("  SAPI Pitch Value: %d", pitch_val);
-
-            int frequency;
-            if (pitch_val < 0) {
-                const double ratio = (pitch_val + 25) / 25.0;
-                frequency = static_cast<int>(std::round(
-                    FREQ_MIN * std::pow(static_cast<double>(default_freq) / FREQ_MIN, ratio)
-                ));
-                DEBUG_LOG("  Mode: LOWER PITCH - Logarithmic scaling from %d to %d Hz", FREQ_MIN, default_freq);
-                DEBUG_LOG("  Ratio: %.2f", ratio);
-            } else if (pitch_val > 0) {
-                const double ratio = pitch_val / 25.0;
-                const double curved_ratio = std::pow(ratio, 1.5);
-                frequency = static_cast<int>(std::round(
-                    default_freq * std::pow(static_cast<double>(FREQ_MAX) / default_freq, curved_ratio)
-                ));
-                DEBUG_LOG("  Mode: HIGHER PITCH - Logarithmic scaling from %d to %d Hz", default_freq, FREQ_MAX);
-                DEBUG_LOG("  Ratio: %.2f, Curved: %.2f", ratio, curved_ratio);
-            } else {
-                frequency = default_freq;
-                DEBUG_LOG("  Mode: NATURAL PITCH - Using voice default");
+            const std::string encoded = text::encode(full, eng);
+            if (encoded.empty()) {
+                DEBUG_LOG("  fragment encoded to nothing, skipped");
+                continue;
             }
-            DEBUG_LOG("  Final Frequency: %d Hz", frequency);
 
-            DEBUG_LOG("--- Final Values Summary ---");
-            DEBUG_LOG("  Native Rate: %d, Sonic: %.2fx, Gain: %d, Frequency: %d Hz",
-                      native_rate, sonic_multiplier, frag_gain, frequency);
-            DEBUG_LOG("===========================\n");
+            DEBUG_LOG("  engine=%s voice=%ls action=%d rate=%d(native %d, stretch %.2fx) "
+                      "pitch=%d(%d hz) volume=%u(gain %d dB, scale %.2fx)",
+                      eng.id, voice.name, static_cast<int>(frag->State.eAction),
+                      frag_rate, sp.native_rate, sp.sonic_speed,
+                      frag_pitch, pitch_hz, frag_volume, sp.native_gain, sp.gain_scale);
+            DEBUG_LOG("  -> engine bytes: %s", encoded.c_str());
 
-#ifdef BUILD_X64
-            g_pipeClient->speak(
-                text.c_str(),
-                voice_index_,
-                native_rate,
-                sonic_multiplier,
-                frag_gain,
-                frequency,
-                speak_callback,
-                &ctx
-            );
-#else
-            b32::speak_async(
-                bst_state_.get(),
-                speak_callback,
-                &ctx,
-                text.c_str(),
-                voice_index_,
-                native_rate,
-                sonic_multiplier,
-                frag_gain,
-                frequency
-            );
+            const int engine_index = voice_.get_engine_index();
+            const ULONGLONG before = ctx.bytes_written;
+
+#ifndef BUILD_X64
+            // Every engine dll is 32-bit, so only a 32-bit host can run one in process.
+            // A 64-bit host skips straight to the helper below.
+            if (!engine_needs_worker(engine_index) && ensure_engine_loaded()) {
+                b32::SpeakParams params;
+                params.text = encoded.c_str();
+                params.sonic_speed = sp.sonic_speed;
+                params.gain_scale = sp.gain_scale;
+                b32::speak_async(bst_state_.get(), speak_callback, &ctx, params);
+            }
 #endif
+
+            // Out of process, through a dedicated b32_helper.exe running one engine on
+            // the thread that opened it. For a 64-bit host this is the only route. For a
+            // 32-bit one it is the recovery path: an engine that returns without a single
+            // sample, and was not interrupted, has failed silently in the shim's audio
+            // capture, and stays out of process for the rest of this process's life.
+            if (ctx.bytes_written == before && !ctx.aborted) {
+#ifndef BUILD_X64
+                if (!engine_needs_worker(engine_index)) {
+                    DEBUG_LOG("  engine %s produced no audio in process; moving it out of "
+                              "process for the rest of this session", eng.id);
+                    mark_engine_needs_worker(engine_index);
+                    bst_state_.reset();
+                    loaded_engine_ = -1;
+                }
+#endif
+                if (ensure_helper_started()) {
+                    if (!helper_.speak(encoded.c_str(), encoded.size(),
+                                       sp.sonic_speed, sp.gain_scale,
+                                       speak_callback, &ctx)) {
+                        // The helper died; drop it so the next utterance starts a new one.
+                        helper_.stop();
+                        helper_engine_ = -1;
+                    }
+                    DEBUG_LOG("  helper produced %llu bytes", ctx.bytes_written - before);
+                }
+            }
+
+            DEBUG_LOG("  <- %llu bytes this fragment, %llu total%s",
+                      ctx.bytes_written - before, ctx.bytes_written,
+                      ctx.aborted ? " (host cancelled)" : "");
 
             if (ctx.aborted) {
                 break;
             }
         }
 
-        DEBUG_LOG("=== Speak Completed Successfully ===");
-        DEBUG_LOG("=== RETURNING from Speak() - Engine ready for next call ===\n");
         return S_OK;
     }
     catch (const std::bad_alloc&) {
-        DEBUG_LOG("=== Speak Failed: Out of memory ===\n");
+        DEBUG_LOG("Speak failed: out of memory");
         return E_OUTOFMEMORY;
     }
     catch (...) {
-        DEBUG_LOG("=== Speak Failed: Unexpected exception ===\n");
+        DEBUG_LOG("Speak failed: unexpected exception");
         return E_UNEXPECTED;
     }
 }

@@ -17,34 +17,25 @@ else()
 endif()
 
 if(NOT BUILD_X64)
-    include(FetchContent)
-
-    FetchContent_Declare(
-        sonic
-        GIT_REPOSITORY https://github.com/waywardgeek/sonic.git
-        GIT_TAG master
+    add_library(pipe_client STATIC
+        src/pipe_client.cpp
     )
-    FetchContent_MakeAvailable(sonic)
 
-    add_library(sonic STATIC
-        ${sonic_SOURCE_DIR}/sonic.c
+    target_include_directories(pipe_client PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
-    target_include_directories(sonic PUBLIC ${sonic_SOURCE_DIR})
 
-    FetchContent_Declare(
-        minhook
-        GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-        GIT_TAG master
+    target_link_libraries(pipe_client PUBLIC shlwapi)
+
+    target_compile_definitions(pipe_client PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
     )
-    FetchContent_GetProperties(minhook)
-    if(NOT minhook_POPULATED)
-        FetchContent_Populate(minhook)
-        add_subdirectory(${minhook_SOURCE_DIR} ${minhook_BINARY_DIR} EXCLUDE_FROM_ALL)
-    endif()
 
     if(MSVC)
-        set_property(TARGET sonic PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        set_property(TARGET minhook PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET pipe_client PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 
     add_library(b32_wrapper STATIC
@@ -55,14 +46,12 @@ if(NOT BUILD_X64)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 
-    target_link_libraries(b32_wrapper PUBLIC
-        winmm
-        sonic
-        minhook
-    )
+    # b32_wrapper.dll is resolved at runtime from the install directory, so nothing
+    # is linked against it here.
 
     target_compile_definitions(b32_wrapper PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
         UNICODE
         _UNICODE
     )
@@ -74,6 +63,8 @@ if(NOT BUILD_X64)
         src/ISpDataKeyImpl.cpp
         src/IEnumSpObjectTokensImpl.cpp
         src/ISpTTSEngineImpl.cpp
+        src/helper_client.cpp
+        src/text_pipeline.cpp
         src/voice_token.cpp
         src/bestspeech_sapi.def
     )
@@ -84,6 +75,7 @@ if(NOT BUILD_X64)
 
     target_link_libraries(BestspeechSAPI PRIVATE
         b32_wrapper
+        pipe_client
         ole32
         oleaut32
         advapi32
@@ -92,6 +84,7 @@ if(NOT BUILD_X64)
 
     target_compile_definitions(BestspeechSAPI PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
         UNICODE
         _UNICODE
     )
@@ -106,10 +99,12 @@ if(NOT BUILD_X64)
 
     target_link_libraries(BestspeechServer PRIVATE
         b32_wrapper
+        shlwapi
     )
 
     target_compile_definitions(BestspeechServer PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
         UNICODE
         _UNICODE
     )
@@ -124,11 +119,141 @@ if(NOT BUILD_X64)
         set_property(TARGET BestspeechServer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 
+    # Verification tooling: prints what the text pipeline hands each engine, so its
+    # output can be diffed against tools/translit_ref.py and fed into the real dll.
+    add_executable(pipeline_probe
+        tools/pipeline_probe.cpp
+        src/text_pipeline.cpp
+    )
+
+    target_include_directories(pipeline_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_compile_definitions(pipeline_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET pipeline_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    add_executable(sapi_probe tools/sapi_probe.cpp)
+
+    target_include_directories(sapi_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(sapi_probe PRIVATE ole32 oleaut32)
+
+    target_compile_definitions(sapi_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET sapi_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    # Registers the voices for the current user and drives them through SAPI itself,
+    # which is the one path the other probes cannot reach.
+    add_executable(token_probe
+        tools/token_probe.cpp
+        src/registry.cpp
+    )
+
+    target_include_directories(token_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(token_probe PRIVATE ole32 oleaut32 advapi32 sapi)
+
+    target_compile_definitions(token_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    add_executable(multi_engine_probe
+        tools/multi_engine_probe.cpp
+        src/b32_wrapper.cpp
+    )
+
+    target_include_directories(multi_engine_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(multi_engine_probe PRIVATE advapi32)
+
+    target_compile_definitions(multi_engine_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET token_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET multi_engine_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    # Shipped with the product: a user-runnable check that walks every installed voice
+    # through SAPI and writes a plain text report, for when a voice will not speak.
+    # Hammers the engine with utterances the host abandons part way through, which is
+    # what a screen reader does constantly. A cancel that leaves the helper protocol out
+    # of step shows up here as a hang or as silence on the utterances that follow.
+    add_executable(cancel_probe tools/cancel_probe.cpp)
+
+    target_include_directories(cancel_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(cancel_probe PRIVATE ole32 oleaut32)
+
+    target_compile_definitions(cancel_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET cancel_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    add_executable(BestSpeechDiagnostics
+        tools/bestspeech_diag.cpp
+        src/registry.cpp
+    )
+
+    target_include_directories(BestSpeechDiagnostics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(BestSpeechDiagnostics PRIVATE ole32 oleaut32 advapi32 sapi)
+
+    target_compile_definitions(BestSpeechDiagnostics PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET BestSpeechDiagnostics PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    file(GLOB BESTSPEECH_ENGINE_DLLS
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/b32_tts.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/dll_*.dll"
+    )
+
+    # The 32-bit shim that drives both engine families, and the standalone helper the
+    # verification tooling uses.
+    set(BESTSPEECH_RUNTIME_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/b32_wrapper.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/bin/b32_helper.exe"
+    )
+
     add_custom_command(TARGET BestspeechSAPI POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/bin/b32_tts.dll"
-            "$<TARGET_FILE_DIR:BestspeechSAPI>/b32_tts.dll"
-        COMMENT "Copying b32_tts.dll to output directory"
+            ${BESTSPEECH_ENGINE_DLLS} ${BESTSPEECH_RUNTIME_FILES}
+            "$<TARGET_FILE_DIR:BestspeechSAPI>"
+        COMMENT "Copying engine dlls and shim to output directory"
     )
 
     install(TARGETS BestspeechSAPI BestspeechServer
@@ -136,7 +261,7 @@ if(NOT BUILD_X64)
         LIBRARY DESTINATION .
     )
 
-    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/bin/b32_tts.dll"
+    install(FILES ${BESTSPEECH_ENGINE_DLLS} ${BESTSPEECH_RUNTIME_FILES}
         DESTINATION .
     )
 
@@ -160,6 +285,7 @@ else()
 
     target_compile_definitions(pipe_client PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
         UNICODE
         _UNICODE
     )
@@ -171,6 +297,8 @@ else()
         src/ISpDataKeyImpl.cpp
         src/IEnumSpObjectTokensImpl.cpp
         src/ISpTTSEngineImpl.cpp
+        src/helper_client.cpp
+        src/text_pipeline.cpp
         src/voice_token.cpp
         src/bestspeech_sapi.def
     )
@@ -189,6 +317,7 @@ else()
 
     target_compile_definitions(BestspeechSAPI PRIVATE
         _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
         UNICODE
         _UNICODE
         BUILD_X64
@@ -202,31 +331,72 @@ else()
         set_property(TARGET BestspeechSAPI PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 
+    add_executable(sapi_probe tools/sapi_probe.cpp)
+
+    target_include_directories(sapi_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(sapi_probe PRIVATE ole32 oleaut32)
+
+    target_compile_definitions(sapi_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET sapi_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    # Shipped with the product: a user-runnable check that walks every installed voice
+    # through SAPI and writes a plain text report, for when a voice will not speak.
+    # Hammers the engine with utterances the host abandons part way through, which is
+    # what a screen reader does constantly. A cancel that leaves the helper protocol out
+    # of step shows up here as a hang or as silence on the utterances that follow.
+    add_executable(cancel_probe tools/cancel_probe.cpp)
+
+    target_include_directories(cancel_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(cancel_probe PRIVATE ole32 oleaut32)
+
+    target_compile_definitions(cancel_probe PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET cancel_probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
+    add_executable(BestSpeechDiagnostics
+        tools/bestspeech_diag.cpp
+        src/registry.cpp
+    )
+
+    target_include_directories(BestSpeechDiagnostics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    target_link_libraries(BestSpeechDiagnostics PRIVATE ole32 oleaut32 advapi32 sapi)
+
+    target_compile_definitions(BestSpeechDiagnostics PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        UNICODE
+        _UNICODE
+    )
+
+    if(MSVC)
+        set_property(TARGET BestSpeechDiagnostics PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+
     install(TARGETS BestspeechSAPI
         RUNTIME DESTINATION .
         LIBRARY DESTINATION .
     )
 endif()
 
-set(CPACK_GENERATOR "INNOSETUP")
-set(CPACK_PACKAGE_NAME "Bestspeech SAPI")
-set(CPACK_PACKAGE_VENDOR "Gozaltech")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Bestspeech Text-to-Speech SAPI5 Engine")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
-set(CPACK_PACKAGE_VERSION_MAJOR "${PROJECT_VERSION_MAJOR}")
-set(CPACK_PACKAGE_VERSION_MINOR "${PROJECT_VERSION_MINOR}")
-set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
-set(CPACK_PACKAGE_INSTALL_DIRECTORY "Bestspeech")
-set(CPACK_PACKAGE_INSTALL_REGISTRY_KEY "BestspeechSAPI")
-set(CPACK_PACKAGE_FILE_NAME "BestspeechSAPI_Setup")
-
-set(CPACK_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/installer")
-set(CPACK_INNOSETUP_USE_CMAKE_BOOL_FORMAT ON)
-
-set(CPACK_INNOSETUP_SETUP_AppPublisherURL "http://gozaltech.org")
-set(CPACK_INNOSETUP_SETUP_DisableWelcomePage "yes")
-set(CPACK_INNOSETUP_SETUP_DisableDirPage "yes")
-set(CPACK_INNOSETUP_SETUP_DisableReadyPage "yes")
-set(CPACK_INNOSETUP_SETUP_DisableProgramGroupPage "yes")
-
-include(CPack)
+# Packaging is handled by build_all.bat, which stages output/ and compiles
+# installer/BestspeechSAPI.iss with Inno Setup directly. CPack's generated script could
+# not express registering two COM servers into two registry views, or stopping the
+# worker process before replacing files it holds open.

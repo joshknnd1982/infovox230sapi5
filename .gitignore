@@ -2,3 +2,10 @@ build
 build_x64
 build_x86
 output
+
+# Scratch audio from manual testing
+*.pcm
+*.wav
+
+__pycache__/
+*.pyc

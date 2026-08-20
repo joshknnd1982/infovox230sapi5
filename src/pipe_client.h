@@ -34,20 +34,27 @@ public:
 
     bool connect();
 
-    bool getVoices(std::vector<VoiceInfo>& voices);
+    // The engine's true output rate, as reported by the worker. Zero if unavailable,
+    // in which case the caller falls back to the rate recorded in engines.hpp.
+    uint32_t getSampleRate(int engineIndex);
 
-    bool speak(const char* text, int voiceIndex, int nativeRate, float sonicMultiplier,
-               int gain, int frequency, PipeAudioCallback callback, void* user);
+    bool speak(const char* text, uint32_t textLength, int engineIndex,
+               float sonicSpeed, float gainScale,
+               PipeAudioCallback callback, void* user);
 
     void shutdownServer();
 
 private:
     bool ensureConnected();
+    bool handshakeOk();
+    bool replaceStaleServer();
     void disconnect();
     bool isServerRunning();
     bool launchServer();
     bool sendCommand(PipeCommand cmd, const void* data = nullptr, uint32_t size = 0);
     bool readResponse(PipeResponse& resp, std::vector<char>& data);
+    bool writeAll(const void* data, uint32_t size);
+    bool readAll(void* data, uint32_t size);
 
     HANDLE pipe_;
     HANDLE serverProcess_;

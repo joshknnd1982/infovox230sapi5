@@ -16,10 +16,14 @@ voice_token::voice_token(const voice_attributes& attr)
     set(L"CLSID", clsid_str.get());
 
     attributes_[L"Age"] = attr.get_age();
-    attributes_[L"Vendor"] = L"Bestspeech";
+    attributes_[L"Vendor"] = attr.get_vendor();
     attributes_[L"Language"] = attr.get_language();
     attributes_[L"Gender"] = attr.get_gender();
     attributes_[L"Name"] = name;
+    // Read back by ISpTTSEngineImpl::SetObjectToken to recover the exact engine and
+    // voice, so a display name never has to be parsed apart.
+    attributes_[L"BstEngine"] = attr.get_engine_id();
+    attributes_[L"BstVoice"] = attr.get_voice_id();
 }
 
 STDMETHODIMP voice_token::OpenKey(LPCWSTR pszSubKeyName, ISpDataKey** ppSubKey)

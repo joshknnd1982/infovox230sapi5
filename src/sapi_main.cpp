@@ -2,8 +2,10 @@
 #include <sapi.h>
 #include "com.hpp"
 #include "registry.hpp"
+#include "voice_attributes.hpp"
 #include "ISpTTSEngineImpl.hpp"
 #include "IEnumSpObjectTokensImpl.hpp"
+#include "voice_registry.hpp"
 
 #ifdef BUILD_X64
 #include "pipe_client.h"
@@ -17,8 +19,6 @@ namespace {
 HINSTANCE g_dll_handle = nullptr;
 Bestspeech::com::class_object_factory g_cls_obj_factory;
 
-const std::wstring token_enums_path = L"Software\\Microsoft\\Speech\\Voices\\TokenEnums";
-
 [[nodiscard]] std::wstring clsid_to_string(const GUID& clsid)
 {
     wchar_t buf[64];
@@ -26,30 +26,20 @@ const std::wstring token_enums_path = L"Software\\Microsoft\\Speech\\Voices\\Tok
     return std::wstring(buf);
 }
 
-void register_token_enumerator()
+// Which registry view these land in is decided by the architecture of the dll doing the
+// registering: the 32-bit build writes under WOW6432Node, where 32-bit SAPI looks, and
+// the 64-bit build writes to the native view, where 64-bit hosts look. Both are
+// installed and registered, so every host sees the full set.
+void register_voice_tokens()
 {
-    using namespace Bestspeech::sapi;
-    using namespace Bestspeech::registry;
-
-    const std::wstring clsid_str = clsid_to_string(__uuidof(IEnumSpObjectTokensImpl));
-
-    key enums_key(HKEY_LOCAL_MACHINE, token_enums_path, KEY_CREATE_SUB_KEY | KEY_SET_VALUE, true);
-    key enum_key(enums_key, L"Bestspeech", KEY_SET_VALUE, true);
-
-    enum_key.set(L"Bestspeech Voices");
-    enum_key.set(L"CLSID", clsid_str);
+    Bestspeech::sapi::write_voice_tokens(
+        HKEY_LOCAL_MACHINE,
+        clsid_to_string(__uuidof(Bestspeech::sapi::ISpTTSEngineImpl)));
 }
 
-void unregister_token_enumerator() noexcept
+void unregister_voice_tokens() noexcept
 {
-    using namespace Bestspeech::registry;
-
-    try {
-        key enums_key(HKEY_LOCAL_MACHINE, token_enums_path, KEY_ALL_ACCESS);
-        enums_key.delete_subkey(L"Bestspeech");
-    }
-    catch (...) {
-    }
+    Bestspeech::sapi::remove_voice_tokens(HKEY_LOCAL_MACHINE);
 }
 }
 
@@ -60,9 +50,8 @@ BOOL APIENTRY DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID /*lpReserved*/
         DisableThreadLibraryCalls(hInstance);
 
 #ifdef BUILD_X64
+        // The engine dlls are 32-bit, so a 64-bit host reaches them through the worker.
         Bestspeech::sapi::InitPipeClient();
-#else
-        b32::set_hinstance(hInstance);
 #endif
 
         try {
@@ -97,7 +86,7 @@ STDAPI DllRegisterServer()
         Bestspeech::com::class_registrar r(g_dll_handle);
         r.register_class<Bestspeech::sapi::IEnumSpObjectTokensImpl>();
         r.register_class<Bestspeech::sapi::ISpTTSEngineImpl>();
-        register_token_enumerator();
+        register_voice_tokens();
         return S_OK;
     }
     catch (const std::bad_alloc&) {
@@ -114,7 +103,7 @@ STDAPI DllUnregisterServer()
 #ifdef BUILD_X64
         Bestspeech::sapi::ShutdownPipeServer();
 #endif
-        unregister_token_enumerator();
+        unregister_voice_tokens();
         Bestspeech::com::class_registrar r(g_dll_handle);
         r.unregister_class<Bestspeech::sapi::IEnumSpObjectTokensImpl>();
         r.unregister_class<Bestspeech::sapi::ISpTTSEngineImpl>();
