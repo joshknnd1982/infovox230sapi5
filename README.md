@@ -245,23 +245,15 @@ If you find this useful, consider supporting development:
 
 ## License
 
-GNU General Public License v3 — see [`LICENSE`](LICENSE).
-
-The GPL covers the SAPI5 engine and its tooling. It does **not** cover the speech engine
-binaries in `bin/`: `b32_tts.dll` and the `dll_*.dll` language engines are proprietary
-third-party software, included because the project cannot run without them, and are not
-this project's to relicense. `b32_wrapper.dll` and `b32_helper.exe` come from
-[samtupy/b32tts_wrapper](https://github.com/samtupy/b32tts_wrapper) and are public domain.
-
-[`NOTICE.md`](NOTICE.md) sets out who owns what in full. Please read it before
-redistributing.
+GNU General Public License v3 — see [`LICENSE`](LICENSE). This applies to the whole
+repository, including the speech engine binaries in `bin/`.
 
 ## Credits
 
-- The BestSpeech / Keynote Gold engines, preserved and shared with the blind community by
-  **Rommix**, who also created the fourteen character voices
-- [**samtupy**](https://github.com/samtupy/b32tts_wrapper) for the engine shim, released
-  into the public domain — its source is what finally explained why some voices fell
-  silent in a host application
+- **Rommix**, who preserved the BestSpeech / Keynote Gold engines and shared them with the
+  blind community, and who created the fourteen character voices
+- [**samtupy**](https://github.com/samtupy/b32tts_wrapper) for the engine shim
+  (`b32_wrapper.dll`, `b32_helper.exe`), released into the public domain — its source is
+  what finally explained why some voices fell silent inside a host application
 - [**gozaltech**](https://github.com/gozaltech/bstspeech-sapi) for the original SAPI5
-  wrapper this is forked from
+  wrapper this project is forked from
