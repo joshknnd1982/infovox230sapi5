@@ -1,0 +1,219 @@
+// Dialogs for the Infovox 230 configuration utility.
+//
+// Written as resources rather than built control by control in code, because a
+// dialog template is what gives Windows -- and so every screen reader -- the
+// reading order, the keyboard order and the label-to-control relationship for
+// free. Three rules are kept throughout:
+//
+//   * every control that can be used has WS_TABSTOP, so Tab reaches all of it;
+//   * every control is immediately preceded in this file by the static text
+//     that names it, which is exactly how MSAA works out a control's name, so
+//     no control is announced as just "edit";
+//   * nothing is owner-drawn and nothing is conveyed by colour, position or
+//     shape alone.
+//
+// The up-down (spinner) controls carry WS_TABSTOP like everything else, and the
+// code gives each one a name of its own at start-up, so tabbing onto one
+// announces which value it changes rather than an anonymous "up-down". Their
+// edit boxes also take the up and down arrow keys (UDS_ARROWKEYS), so the same
+// adjustment is available without leaving the box.
+
+#include <windows.h>
+#include <commctrl.h>
+
+#include "ivx_config_res.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+/////////////////////////////////////////////////////////////////////////////
+// The main window: the list of voices, and what can be done with one.
+
+IDD_MAIN DIALOGEX 0, 0, 420, 290
+STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Infovox 230 Configuration"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "&Voices. Choose one, then choose Change:", -1, 7, 7, 190, 8
+    LISTBOX         IDC_VOICE_LIST, 7, 18, 190, 140,
+                    LBS_NOTIFY | LBS_HASSTRINGS | LBS_USETABSTOPS | WS_BORDER | WS_VSCROLL | WS_TABSTOP
+
+    PUSHBUTTON      "&New voice...", IDC_NEW, 7, 162, 60, 14
+    PUSHBUTTON      "&Change...", IDC_CHANGE, 71, 162, 60, 14
+    PUSHBUTTON      "D&uplicate...", IDC_DUPLICATE, 135, 162, 62, 14
+    PUSHBUTTON      "&Rename...", IDC_RENAME, 7, 180, 60, 14
+    PUSHBUTTON      "&Delete", IDC_DELETE, 71, 180, 60, 14
+    PUSHBUTTON      "&Preview", IDC_PREVIEW, 135, 180, 62, 14
+    PUSHBUTTON      "Stop spea&king", IDC_STOP, 135, 198, 62, 14
+
+    LTEXT           "Selected voice de&tails (read only):", -1, 205, 7, 208, 8
+    EDITTEXT        IDC_DETAILS, 205, 18, 208, 194,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Where your voices are kept", -1, 7, 216, 406, 44
+    LTEXT           "Save my voices &for:", -1, 14, 230, 74, 8
+    COMBOBOX        IDC_SCOPE, 92, 228, 160, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "F&ile in use (read only):", -1, 14, 246, 74, 8
+    EDITTEXT        IDC_INIPATH, 92, 244, 314, 12, ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP
+
+    LTEXT           "St&atus (read only):", -1, 7, 266, 66, 8
+    EDITTEXT        IDC_STATUS, 76, 264, 337, 12, ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP
+
+    PUSHBUTTON      "En&gine settings...", IDC_ENGINE_SETTINGS, 7, 282, 74, 14
+    PUSHBUTTON      "Publish voices to &Windows", IDC_PUBLISH, 85, 282, 108, 14
+    PUSHBUTTON      "&Save", IDC_SAVE, 251, 282, 50, 14
+    PUSHBUTTON      "&Help", IDC_HELP_BUTTON, 305, 282, 50, 14
+    DEFPUSHBUTTON   "Cl&ose", IDC_CLOSE, 359, 282, 54, 14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// One voice: every setting the engine reads for it.
+
+IDD_VOICE DIALOGEX 0, 0, 426, 300
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Voice settings"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    GROUPBOX        "The voice", -1, 7, 4, 203, 178
+
+    LTEXT           "Voice &name:", -1, 14, 18, 90, 8
+    EDITTEXT        IDC_V_NAME, 108, 16, 94, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "&Based on:", -1, 14, 34, 90, 8
+    COMBOBOX        IDC_V_BASEDON, 108, 32, 94, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Language:", -1, 14, 50, 90, 8
+    COMBOBOX        IDC_V_LANGUAGE, 108, 48, 94, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Pitch, 27 to 99:", -1, 14, 66, 90, 8
+    EDITTEXT        IDC_V_PITCH, 108, 64, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_V_PITCH_SPIN, "msctls_updown32",
+                    UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS |
+                    UDS_NOTHOUSANDS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 12
+
+    LTEXT           "Pitch in hert&z (read only):", -1, 14, 82, 90, 8
+    EDITTEXT        IDC_V_PITCH_HZ, 108, 80, 44, 12, ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP
+
+    LTEXT           "Loudness, &Dynamic, 0 to 100:", -1, 14, 98, 90, 16
+    EDITTEXT        IDC_V_DYNAMIC, 108, 98, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_V_DYNAMIC_SPIN, "msctls_updown32",
+                    UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS |
+                    UDS_NOTHOUSANDS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 12
+
+    LTEXT           "Breathiness, &Aspiration, 0 to 100:", -1, 14, 116, 90, 16
+    EDITTEXT        IDC_V_ASPIRATION, 108, 116, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_V_ASPIRATION_SPIN, "msctls_updown32",
+                    UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS |
+                    UDS_NOTHOUSANDS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 12
+
+    LTEXT           "&Vocal tract shape:", -1, 14, 136, 90, 8
+    COMBOBOX        IDC_V_FORMANT, 108, 134, 94, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Gender reported:", -1, 14, 152, 90, 8
+    COMBOBOX        IDC_V_GENDER, 108, 150, 94, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Age in &years:", -1, 14, 168, 90, 8
+    EDITTEXT        IDC_V_AGE, 108, 166, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_V_AGE_SPIN, "msctls_updown32",
+                    UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS |
+                    UDS_NOTHOUSANDS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 12
+
+    GROUPBOX        "Advanced: names and data files", -1, 216, 4, 203, 178
+
+    LTEXT           "Speaker name given to the engine:", -1, 223, 16, 186, 8
+    EDITTEXT        IDC_V_SPEAKER_NAME, 223, 26, 186, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Speaker style:", -1, 223, 42, 90, 8
+    EDITTEXT        IDC_V_SPEAKER_STYLE, 316, 40, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Language rule file:", -1, 223, 58, 90, 8
+    EDITTEXT        IDC_V_LANGUAGE_FILE, 316, 56, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Language number:", -1, 223, 74, 90, 8
+    EDITTEXT        IDC_V_LANGUAGE_ID, 316, 72, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Windows language code, in hexadecimal:", -1, 223, 88, 186, 16
+    EDITTEXT        IDC_V_LCID, 316, 104, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Library file:", -1, 223, 122, 90, 8
+    EDITTEXT        IDC_V_LIBRARY_FILE, 316, 120, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Phoneme symbol file:", -1, 223, 138, 90, 8
+    EDITTEXT        IDC_V_PHSYM_FILE, 316, 136, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Diphone file:", -1, 223, 154, 90, 8
+    EDITTEXT        IDC_V_DIPHONE_FILE, 316, 152, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "Mapping file:", -1, 223, 170, 90, 8
+    EDITTEXT        IDC_V_MAPPING_FILE, 316, 168, 93, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "What t&hese settings do (read only):", -1, 7, 188, 200, 8
+    EDITTEXT        IDC_V_HINT, 7, 198, 412, 76,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+
+    PUSHBUTTON      "P&review this voice", IDC_V_PREVIEW, 7, 280, 80, 14
+    DEFPUSHBUTTON   "OK", IDOK, 311, 280, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 369, 280, 50, 14
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// Everything that is not a property of one voice.
+
+IDD_ENGINE DIALOGEX 0, 0, 463, 300
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Engine settings"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    GROUPBOX        "Sound", -1, 7, 4, 220, 60
+    CONTROL         "&Trim the inaudible padding at the end of every utterance",
+                    IDC_E_TRIM, "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP,
+                    14, 15, 206, 18
+    LTEXT           "Level counted as &silence, 0 to 1000:", -1, 14, 38, 150, 16
+    EDITTEXT        IDC_E_THRESHOLD, 170, 40, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    CONTROL         "", IDC_E_THRESHOLD_SPIN, "msctls_updown32",
+                    UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS |
+                    UDS_NOTHOUSANDS | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 12
+
+    GROUPBOX        "Reporting where the engine is in the text", -1, 7, 68, 220, 48
+    CONTROL         "Report &word positions while speaking", IDC_E_WORDS, "Button",
+                    BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 14, 82, 206, 14
+    CONTROL         "Report s&entence positions while speaking", IDC_E_SENTENCES, "Button",
+                    BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 14, 98, 206, 14
+
+    GROUPBOX        "Waiting for the engine", -1, 7, 120, 220, 52
+    LTEXT           "&Give up on an utterance after, in milliseconds:", -1, 14, 133, 150, 16
+    EDITTEXT        IDC_E_TIMEOUT, 170, 135, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "...plus this many per &character:", -1, 14, 153, 150, 8
+    EDITTEXT        IDC_E_TIMEOUT_PER_CHAR, 170, 151, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+
+    GROUPBOX        "Logging", -1, 7, 176, 220, 40
+    LTEXT           "&Log detail:", -1, 14, 192, 60, 8
+    COMBOBOX        IDC_E_LOGLEVEL, 78, 190, 140, 140, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "How far the rate and pitch controls reach", -1, 236, 4, 220, 124
+    LTEXT           "Zero in any of these means: use what the engine reports for itself.",
+                    -1, 243, 15, 206, 16
+    LTEXT           "Slowest &rate, words a minute:", -1, 243, 34, 148, 8
+    EDITTEXT        IDC_E_RATE_MIN, 397, 32, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "&Fastest rate, words a minute:", -1, 243, 50, 148, 8
+    EDITTEXT        IDC_E_RATE_MAX, 397, 48, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "&Normal rate, words a minute:", -1, 243, 66, 148, 8
+    EDITTEXT        IDC_E_RATE_DEFAULT, 397, 64, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "L&owest pitch, hertz:", -1, 243, 82, 148, 8
+    EDITTEXT        IDC_E_PITCH_MIN, 397, 80, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "&Highest pitch, hertz:", -1, 243, 98, 148, 8
+    EDITTEXT        IDC_E_PITCH_MAX, 397, 96, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "Nor&mal pitch, hertz:", -1, 243, 114, 148, 8
+    EDITTEXT        IDC_E_PITCH_DEFAULT, 397, 112, 44, 12, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+
+    GROUPBOX        "Preview", -1, 236, 132, 220, 44
+    LTEXT           "Sentence spoken by &Preview:", -1, 243, 144, 206, 8
+    EDITTEXT        IDC_E_PREVIEW_TEXT, 243, 156, 206, 12, ES_AUTOHSCROLL | WS_TABSTOP
+
+    LTEXT           "About t&hese settings (read only):", -1, 7, 222, 200, 8
+    EDITTEXT        IDC_E_HINT, 7, 232, 449, 42,
+                    ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+
+    PUSHBUTTON      "Put everything back to its &default", IDC_E_DEFAULTS, 7, 280, 130, 14
+    DEFPUSHBUTTON   "OK", IDOK, 345, 280, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 403, 280, 53, 14
+END

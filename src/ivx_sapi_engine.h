@@ -14,6 +14,7 @@
 
 #include "ivx_client.h"
 #include "ivx_com.h"
+#include "ivx_settings.h"
 
 namespace ivx {
 namespace sapi5 {
@@ -80,6 +81,13 @@ private:
     void emit_bookmark(uint32_t number, unsigned long stream_offset, ISpTTSEngineSite* site);
 
     WorkerClient client_;
+
+    // Everything the user has set that is not a property of one voice: whether
+    // the trailing padding is trimmed and at what level, whether positions in
+    // the text are reported, and how long a wedged engine is waited for. Read
+    // from the catalogue this dll has already loaded, so it costs nothing.
+    const EngineSettings& settings_;
+
     ISpObjectToken* token_ = nullptr;
     std::string mode_guid_;
     std::wstring voice_name_;
@@ -88,6 +96,7 @@ private:
     bool have_format_ = false;
 
     // Live only for the duration of one Speak call.
+    bool want_words_ = true;
     std::vector<std::wstring> bookmarks_;
     std::vector<BYTE> quiet_;
     unsigned long stream_offset_ = 0;

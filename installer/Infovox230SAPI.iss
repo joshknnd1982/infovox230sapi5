@@ -23,7 +23,7 @@
 
 #define AppName "Infovox 230 SAPI5 Voices"
 #define AppShortName "Infovox 230"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define AppPublisher "Infovox 230 SAPI5 project"
 #define StageDir "..\output"
 
@@ -33,6 +33,10 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
+; Stamped into the setup program itself, so which build someone is running can
+; be read from its properties without starting it.
+VersionInfoVersion={#AppVersion}
+VersionInfoProductName={#AppName}
 DefaultDirName={autopf}\Infovox230
 DefaultGroupName={#AppShortName}
 OutputDir={#StageDir}
@@ -68,6 +72,10 @@ Source: "{#StageDir}\Infovox230Server.exe";   DestDir: "{app}"; Flags: ignorever
 Source: "{#StageDir}\Infovox230Diag.exe";     DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
 Source: "{#StageDir}\Infovox230SapiTest.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
 
+; --- the configuration utility: define your own voices, and set everything the
+;     engine can be told, without editing a file by hand
+Source: "{#StageDir}\Infovox230Config.exe";   DestDir: "{app}"; Flags: ignoreversion restartreplace uninsrestartdelete
+
 ; --- the speech engine itself: every language rule file and the runtime
 Source: "{#StageDir}\engine\*"; DestDir: "{app}\engine"; Flags: ignoreversion restartreplace uninsrestartdelete recursesubdirs createallsubdirs
 
@@ -80,7 +88,17 @@ Source: "{#StageDir}\x64\Infovox230SapiTest.exe"; DestDir: "{app}\x64"; Flags: i
 Source: "..\docs\README.txt";        DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\voices.example.ini"; DestDir: "{app}"; Flags: ignoreversion
 
+[Tasks]
+; Offered rather than assumed, and checked to begin with: the configuration
+; utility is where someone goes to make the voices their own, and a desktop icon
+; is the shortest route to it for anyone driving Windows from the keyboard.
+Name: "desktopicon"; \
+    Description: "Put an &icon for the Infovox 230 configuration utility on the desktop"; \
+    GroupDescription: "Additional icons:"
+
 [Icons]
+Name: "{group}\Infovox 230 Configuration"; Filename: "{app}\Infovox230Config.exe"; Comment: "Define your own voices and change every engine setting"
+Name: "{autodesktop}\Infovox 230 Configuration"; Filename: "{app}\Infovox230Config.exe"; Comment: "Define your own voices and change every engine setting"; Tasks: desktopicon
 Name: "{group}\Speak a test sentence";  Filename: "{app}\Infovox230SapiTest.exe"; Parameters: "say"; Comment: "Speaks aloud with the first Infovox voice, to check the voices are working"
 Name: "{group}\List the Infovox voices"; Filename: "{app}\Infovox230Diag.exe"; Parameters: "list"; Comment: "Lists every installed voice and its language"
 Name: "{group}\Refresh the voice list";  Filename: "{sys}\regsvr32.exe"; Parameters: "/s ""{app}\Infovox230SAPI.dll"""; Comment: "Republishes the voices after editing voices.ini"
@@ -143,6 +161,16 @@ begin
   SummaryMemo.Lines.Add('The voices become available to every program that uses Windows');
   SummaryMemo.Lines.Add('speech, including NVDA, JAWS, Narrator, Balabolka and Word.');
   SummaryMemo.Lines.Add('');
+  SummaryMemo.Lines.Add('A configuration utility is installed with them. It is where you');
+  SummaryMemo.Lines.Add('define voices of your own -- as many as 256 alongside the sixty --');
+  SummaryMemo.Lines.Add('by setting the pitch, loudness, breathiness and vocal tract shape');
+  SummaryMemo.Lines.Add('the engine builds a voice from, and where every other engine');
+  SummaryMemo.Lines.Add('setting can be changed. It can speak a voice back to you before');
+  SummaryMemo.Lines.Add('you keep it. Every control in it can be reached with the Tab key');
+  SummaryMemo.Lines.Add('and is named for a screen reader.');
+  SummaryMemo.Lines.Add('');
+  SummaryMemo.Lines.Add('You will be offered a desktop icon for it on the next page.');
+  SummaryMemo.Lines.Add('');
   SummaryMemo.Lines.Add('Both a 32-bit and a 64-bit speech interface are installed, so');
   SummaryMemo.Lines.Add('32-bit and 64-bit programs can both use the voices.');
   SummaryMemo.Lines.Add('');
@@ -177,6 +205,10 @@ var
 begin
   Log('Infovox: stopping any running worker');
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM Infovox230Server.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // The configuration utility holds its own file open while it is running, and
+  // someone reinstalling is quite likely to have left it open.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM Infovox230Config.exe',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(500);
 end;
@@ -276,6 +308,12 @@ end;
 Filename: "{app}\Infovox230SapiTest.exe"; Parameters: "say"; \
     Description: "Speak a test sentence now"; \
     Flags: postinstall nowait skipifsilent runhidden
+
+; Left unticked: it opens a window, and someone who only wanted the voices
+; should not have one appear without asking.
+Filename: "{app}\Infovox230Config.exe"; \
+    Description: "Open the Infovox 230 configuration utility to make voices of my own"; \
+    Flags: postinstall nowait skipifsilent unchecked
 
 [UninstallDelete]
 ; The engine writes nothing outside the install folder, but the logs and any

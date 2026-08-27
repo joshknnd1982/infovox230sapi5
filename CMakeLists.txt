@@ -44,6 +44,7 @@ add_library(ivx_common STATIC
     src/ivx_log.cpp
     src/ivx_paths.cpp
     src/ivx_catalog.cpp
+    src/ivx_settings.cpp
     src/ivx_vregistry.cpp
 )
 target_include_directories(ivx_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -80,6 +81,20 @@ if(NOT IVX_X64)
 
     add_executable(Infovox230Server src/ivx_server.cpp)
     target_link_libraries(Infovox230Server PRIVATE ivx_engine)
+
+    # The configuration utility. 32-bit only and not because of the engine --
+    # it never loads it -- but because there is no reason to ship two of a
+    # program a person runs by hand, and the 32-bit one runs everywhere.
+    #
+    # It speaks through the worker like any other client, so previewing a voice
+    # exercises the same path a screen reader does.
+    add_executable(Infovox230Config WIN32
+        src/ivx_config_app.cpp
+        src/ivx_config_model.cpp
+        src/ivx_client.cpp
+        src/ivx_config.rc
+    )
+    target_link_libraries(Infovox230Config PRIVATE ivx_common comctl32 winmm shell32 ole32)
 endif()
 
 # Diagnostics are built for both architectures. The 32-bit one can drive the
@@ -123,4 +138,10 @@ else()
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${IVX_ENGINE_SOURCE} ${IVX_STAGE}/engine
         COMMENT "Staging the 32-bit engine, worker and voice data")
+
+    add_custom_command(TARGET Infovox230Config POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${IVX_STAGE}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:Infovox230Config> ${IVX_STAGE}/
+        COMMENT "Staging the configuration utility")
 endif()

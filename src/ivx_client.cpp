@@ -402,7 +402,10 @@ void WorkerClient::shutdown_worker()
         CloseHandle(pipe_);
         pipe_ = INVALID_HANDLE_VALUE;
     }
-    for (int i = 0; i < 40 && worker_running(); ++i) {
+    // Until the mutex is released the worker is still there, and connecting
+    // again would reach the one that is leaving rather than a fresh one with a
+    // freshly read voices.ini.
+    for (int i = 0; i < 200 && worker_running(); ++i) {
         Sleep(50);
     }
     IVX_INFO("client: worker shutdown %s", worker_running() ? "did not complete" : "complete");

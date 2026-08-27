@@ -206,10 +206,18 @@ void Catalog::load(const std::wstring& module_dir)
     }
     IVX_INFO("catalog: %u built-in voices", static_cast<unsigned>(voices_.size()));
 
-    if (!module_dir.empty()) {
-        load_user_voices(module_dir + L"\\voices.ini");
+    // The machine-wide file first, then the personal one, so a setting or a
+    // voice defined for just one user wins over the same one defined for
+    // everybody.
+    const std::wstring shared_ini =
+        module_dir.empty() ? std::wstring() : module_dir + L"\\voices.ini";
+    const std::wstring personal_ini = local_appdata_ini();
+    if (!shared_ini.empty()) {
+        load_user_voices(shared_ini);
+        settings_.merge_from(shared_ini);
     }
-    load_user_voices(local_appdata_ini());
+    load_user_voices(personal_ini);
+    settings_.merge_from(personal_ini);
 }
 
 void Catalog::load_user_voices(const std::wstring& ini_path)

@@ -66,7 +66,7 @@ void append_tag(std::wstring& tagged, std::vector<uint32_t>& source, const std::
 
 }  // namespace
 
-TtsEngine::TtsEngine() = default;
+TtsEngine::TtsEngine() : settings_(shared_catalog().settings()) {}
 
 TtsEngine::~TtsEngine()
 {
@@ -249,10 +249,6 @@ void TtsEngine::emit_word(const Run& run, uint32_t tagged_index, unsigned long s
               stream_offset);
 }
 
-// Anything at or below this is inaudible: 16 out of 32767 is about 66 decibels
-// below full scale, and the padding being trimmed sits at plus or minus one.
-static const int kQuietLevel = 16;
-
 bool TtsEngine::write_bytes(const void* data, unsigned long bytes, ISpTTSEngineSite* site)
 {
     // Hand the audio over in small pieces rather than all at once.
@@ -312,17 +308,22 @@ bool TtsEngine::flush_quiet(ISpTTSEngineSite* site)
 
 bool TtsEngine::feed_audio(const void* data, unsigned long bytes, ISpTTSEngineSite* site)
 {
-    // Only 16-bit PCM is inspected; anything else goes straight through.
-    if (format_.bits != 16 || bytes < 2) {
+    // Only 16-bit PCM is inspected; anything else goes straight through, as
+    // does everything when the user has asked to hear the engine untrimmed.
+    if (format_.bits != 16 || bytes < 2 || !settings_.trim_trailing_silence) {
         return flush_quiet(site) && write_bytes(data, bytes, site);
     }
 
+    // Anything at or below this level is inaudible: the default of 16 out of
+    // 32767 is about 66 decibels below full scale, and the padding being
+    // trimmed sits at plus or minus one.
+    const int quiet_level = settings_.silence_threshold;
     const short* samples = static_cast<const short*>(data);
     const size_t count = bytes / sizeof(short);
     size_t last_loud = count;  // count means "nothing loud in this chunk"
     for (size_t i = count; i-- > 0;) {
         const int value = samples[i] < 0 ? -samples[i] : samples[i];
-        if (value > kQuietLevel) {
+        if (value > quiet_level) {
             last_loud = i;
             break;
         }
@@ -410,7 +411,7 @@ HRESULT TtsEngine::run_action(const Action& action, ISpTTSEngineSite* site)
         const unsigned long at = base_offset + ev.audio_offset;
         if (ev.kind == EV_BOOKMARK) {
             emit_bookmark(ev.value, at, site);
-        } else if (ev.kind == EV_WORD && ev.value > 0) {
+        } else if (ev.kind == EV_WORD && ev.value > 0 && want_words_) {
             emit_word(run, ev.value - 1, at, site);
         }
     };
@@ -423,9 +424,11 @@ HRESULT TtsEngine::run_action(const Action& action, ISpTTSEngineSite* site)
     };
 
     // Long text at the slowest rate really can take minutes; the ceiling exists
-    // only so a wedged engine cannot hang the application for ever.
-    const unsigned timeout =
-        static_cast<unsigned>(30000 + run.tagged.size() * 200);
+    // only so a wedged engine cannot hang the application for ever. Both halves
+    // of it are the user's to change.
+    const unsigned timeout = static_cast<unsigned>(
+        settings_.timeout_base_ms +
+        static_cast<long long>(run.tagged.size()) * settings_.timeout_per_char_ms);
 
     DoneResponse done = {};
     bool ok;
@@ -484,8 +487,13 @@ STDMETHODIMP TtsEngine::Speak(DWORD flags, REFGUID, const WAVEFORMATEX*,
 
     ULONGLONG interest = 0;
     site->GetEventInterest(&interest);
-    const bool want_sentences = (interest & SPFEI(SPEI_SENTENCE_BOUNDARY)) != 0;
-    const bool want_words = (interest & SPFEI(SPEI_WORD_BOUNDARY)) != 0;
+    // The host asks for the events it wants; the user can decline to send them
+    // at all, which is the setting to reach for when a program's own word
+    // highlighting is more trouble than it is worth.
+    const bool want_sentences =
+        settings_.sentence_events && (interest & SPFEI(SPEI_SENTENCE_BOUNDARY)) != 0;
+    const bool want_words = settings_.word_events && (interest & SPFEI(SPEI_WORD_BOUNDARY)) != 0;
+    want_words_ = want_words;
 
     IVX_DEBUG("sapi: Speak flags=0x%08lX rate=%ld volume=%u interest=0x%llX (sentences=%d words=%d)",
               flags, base_rate, base_volume, interest, want_sentences ? 1 : 0,

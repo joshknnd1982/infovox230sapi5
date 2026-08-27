@@ -15,6 +15,8 @@ Checking it works
 
 Start menu, under "Infovox 230":
 
+  Infovox 230 Configuration define voices of your own, and change every
+                            setting the engine has
   Speak a test sentence     speaks aloud with the first Infovox voice
   List the Infovox voices   prints every voice, its language and gender
   Refresh the voice list    republishes the voices after editing voices.ini
@@ -62,6 +64,10 @@ From any speech program, in the usual way:
 The engine also reports where it is in the text as it speaks, so programs that
 highlight the current word while reading will do so.
 
+Everything else -- which voices exist, what each one sounds like, how far the
+rate and pitch controls reach, and the engine's own behaviour -- is set in the
+configuration utility, described below.
+
 Responsiveness, which matters most when arrowing quickly through text: pressing
 a key interrupts what is being said and starts the next line in about 40
 milliseconds, measured through Windows speech at twenty keypresses a second.
@@ -88,17 +94,88 @@ about eight tenths of a second longer than the same words through Windows
 speech. That is the diagnostic showing you the raw engine output, not a fault.
 
 
-Adding your own voices
-----------------------
+The configuration utility
+-------------------------
 
-The five speakers of each language differ only in four numbers the engine reads:
-base pitch, loudness contour, breathiness, and which vocal tract shape to use.
-Those numbers are yours to change, and you can define as many extra voices as
-you like -- up to 256 of your own, alongside the 60 built in.
+Start menu, Infovox 230, "Infovox 230 Configuration"; and on the desktop too, if
+you asked the installer for an icon there.
 
-See voices.example.ini in this folder. Copy it to voices.ini -- either here, or
+This is where voices are made. The five speakers of each language differ only in
+four numbers the engine reads -- base pitch, loudness contour, breathiness, and
+which of five vocal tract shapes to use -- and those numbers are yours. You can
+define as many as 256 voices of your own alongside the sixty built in, in any of
+the twelve languages, and you can change the built-in voices as well.
+
+The main window lists every voice. Choose one and:
+
+  New voice        start a new voice, taking its settings from the one selected
+  Change           alter the selected voice
+  Duplicate        copy it under a new name, so the original is left alone
+  Rename           give one of your own voices a different name
+  Delete           remove one of your voices, or put a built-in one back as it
+                   was made
+  Preview          speak the voice, as it now stands
+
+Preview is worth knowing about: it speaks the settings as they are at that
+moment, before anything has been kept, so a voice can be listened to and
+adjusted until it is right. It restarts the speech engine to do it, which takes
+about a second, and a screen reader speaking through an Infovox voice will pause
+while that happens.
+
+Save writes the voices to a file. "Publish voices to Windows" is the separate
+step that puts them in the Windows voice list where your programs will find
+them; it needs administrator permission, and Windows asks for it at that point
+rather than the utility demanding it for everything else. A program that is
+already running will not see a new voice until it is restarted.
+
+Voices can be kept for just you (%LOCALAPPDATA%\Infovox230SAPI\voices.ini) or
+for everybody (voices.ini in the installation folder). "Just me" needs no
+special permission and is what the utility starts with; for "All users", start
+the utility with "Run as administrator".
+
+Engine settings covers everything that is not a property of one voice: whether
+the padding at the end of each utterance is trimmed and at what level, whether
+positions in the text are reported while speaking, how long a wedged engine is
+waited for, how far the rate and pitch controls in your programs reach, the
+sentence Preview speaks, and how much detail is written to the log.
+
+Everything is kept when you close the utility -- it asks first, and asks whether
+to publish, so nothing is written or announced to Windows behind your back.
+
+
+Using it with a screen reader
+-----------------------------
+
+The utility was built to be driven without seeing it:
+
+  * every control can be reached with the Tab key, and Shift+Tab back;
+  * every control has a name of its own, taken from the text beside it, so
+    nothing is announced as just "edit" or "combo box";
+  * everything is a standard Windows control -- nothing is drawn by hand;
+  * each number box takes the up and down arrow keys as well as typed digits;
+  * anything the utility has to tell you appears in a read-only box you can
+    put the cursor in and read line by line, not in a label that a screen
+    reader would skip: the details of the selected voice, the status of the
+    last thing you did, the file being edited, and the notes on each page;
+  * alt with the underlined letter reaches every button and box directly;
+  * when a preview starts, focus moves to the "Stop speaking" button, so the
+    way to stop it is under your hands already;
+  * nothing is said with colour, position or shape alone.
+
+The pitch box has a companion box, next to it, that shows the same pitch in
+hertz as you change it -- the engine's own pitch number is not hertz, and this
+saves doing the arithmetic.
+
+
+Adding your own voices by hand
+------------------------------
+
+The utility writes an ordinary ini file, and you can write it yourself instead.
+See voices.example.ini in this folder: copy it to voices.ini -- either here, or
 in %LOCALAPPDATA%\Infovox230SAPI\ for just yourself -- edit it, then use
-"Refresh the voice list" from the Start menu.
+"Refresh the voice list" from the Start menu. The utility keeps your comments
+and anything in the file it does not recognise, so the two ways of working can
+be mixed.
 
 Pitch is worth one note, because the number is not in hertz: the engine works
 out the pitch as 3 x Pitch - 49, and clamps the result to between 30 and 250
@@ -110,6 +187,8 @@ with its language, because the engine checks that and quietly ignores any voice
 whose name it does not recognise; that renaming is done for you and does not
 change what you or your programs see.
 
+The same file's [Settings] section holds the engine-wide settings the utility's
+Engine settings page writes. voices.example.ini lists all of them.
 
 Logs
 ----
@@ -125,8 +204,9 @@ log is beside it as install.log.
 
 The log is capped at 8 MB and rolls over to infovox230.log.1.
 
-To turn the detail up or down, create a file called loglevel.txt in that same
-folder containing a single number:
+To turn the detail up or down, use the configuration utility: Engine settings,
+"Log detail". It writes a file called loglevel.txt in that same folder holding a
+single number, which you can also write yourself:
 
   0  off
   1  errors only

@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "ivx_settings.h"
+
 namespace ivx {
 
 // A row of the generated table in ivx_voices.inc. Kept as plain char pointers
@@ -82,6 +84,11 @@ public:
     void load(const std::wstring& module_dir);
 
     const std::vector<Voice>& voices() const { return voices_; }
+
+    // The [Settings] section of those same files: everything that is not a
+    // property of one voice.
+    const EngineSettings& settings() const { return settings_; }
+
     size_t size() const { return voices_.size(); }
 
     // Index of the voice whose display name matches, or -1.
@@ -106,6 +113,7 @@ private:
     void load_user_voices(const std::wstring& ini_path);
 
     std::vector<Voice> voices_;
+    EngineSettings settings_;
 };
 
 }  // namespace ivx

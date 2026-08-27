@@ -208,10 +208,20 @@ void run_job(Job* job)
         return job->cancel && WaitForSingleObject(job->cancel, 0) == WAIT_OBJECT_0;
     };
 
-    const int rate = step_to_value(job->rate_step, g_engine.rate_min(), g_engine.rate_max(),
-                                   g_engine.rate_default());
-    const int pitch = step_to_value(job->pitch_step, g_engine.pitch_min(), g_engine.pitch_max(),
-                                    g_engine.pitch_default());
+    // The engine reports its own limits per mode; a user who wants the ends of
+    // the rate or pitch control to reach somewhere else says so in [Settings],
+    // and zero there means "whatever the engine said".
+    const EngineSettings& settings = g_catalog.settings();
+    auto chosen = [](int override_value, int engine_value) {
+        return override_value > 0 ? override_value : engine_value;
+    };
+    const int rate = step_to_value(job->rate_step, chosen(settings.rate_min, g_engine.rate_min()),
+                                   chosen(settings.rate_max, g_engine.rate_max()),
+                                   chosen(settings.rate_default, g_engine.rate_default()));
+    const int pitch =
+        step_to_value(job->pitch_step, chosen(settings.pitch_min, g_engine.pitch_min()),
+                      chosen(settings.pitch_max, g_engine.pitch_max()),
+                      chosen(settings.pitch_default, g_engine.pitch_default()));
     IVX_DEBUG("server: rate step %d -> %d wpm, pitch step %d -> %d Hz, volume %d%%",
               job->rate_step, rate, job->pitch_step, pitch, job->volume_pct);
 
@@ -492,6 +502,21 @@ DWORD WINAPI client_thread(LPVOID param)
                 write_frame(pipe, RSP_OK);
                 IVX_INFO("server: shutdown requested by a client");
                 SetEvent(g_quit);
+                // The thread that accepts connections is sitting inside
+                // ConnectNamedPipe and will not look at g_quit until something
+                // connects. Connecting to our own pipe and dropping it again is
+                // what lets it look. Without this the worker stays alive until
+                // the next client arrives -- and that client is then served by
+                // a worker that is on its way out, which is exactly what
+                // happens when the configuration utility restarts the engine to
+                // preview a voice it has just defined.
+                {
+                    HANDLE poke = CreateFileW(pipe_name().c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                              nullptr, OPEN_EXISTING, 0, nullptr);
+                    if (poke != INVALID_HANDLE_VALUE) {
+                        CloseHandle(poke);
+                    }
+                }
                 break;
             default:
                 write_error(pipe, "unknown request");
