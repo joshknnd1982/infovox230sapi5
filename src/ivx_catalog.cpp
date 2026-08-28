@@ -5,6 +5,7 @@
 #include <cstdio>
 
 #include "ivx_log.h"
+#include "ivx_paths.h"
 #include "ivx_vregistry.h"
 
 namespace ivx {
@@ -16,6 +17,11 @@ namespace {
 // nothing under it ever reaches the real registry.
 constexpr char kEngineRoot[] = "Software\\Babel-Infovox AB\\Infovox 230";
 constexpr char kModesRoot[] = "Software\\Babel-Infovox AB\\Infovox 230\\Modes";
+
+// What the installer leaves behind to say which languages and voices were
+// chosen on its components page: [Languages] and [Voices], one key per name.
+// See installer/installed.header.ini and tools/gen_installer_voices.py.
+constexpr wchar_t kInstalledIni[] = L"installed.ini";
 
 std::wstring widen(const std::string& s)
 {
@@ -57,6 +63,33 @@ std::wstring ini_string(const wchar_t* path, const wchar_t* section, const wchar
     wchar_t buf[512];
     GetPrivateProfileStringW(section, key, fallback, buf, 512, path);
     return trim(buf);
+}
+
+// The key names of one section, in the order the file lists them. Only the
+// names matter: the installer writes every one of them with the value 1, and a
+// name being there at all is the whole of what it has to say.
+std::vector<std::string> ini_section_keys(const std::wstring& path, const wchar_t* section)
+{
+    std::vector<std::string> keys;
+    std::vector<wchar_t> buf(32768);
+    const DWORD n = GetPrivateProfileSectionW(section, buf.data(),
+                                              static_cast<DWORD>(buf.size()), path.c_str());
+    if (n == 0) {
+        return keys;
+    }
+    // Double-NUL terminated, one "Key=Value" per entry.
+    for (const wchar_t* entry = buf.data(); *entry; entry += wcslen(entry) + 1) {
+        const std::wstring line = entry;
+        if (line.empty() || line[0] == L';') {
+            continue;
+        }
+        const size_t eq = line.find(L'=');
+        const std::wstring name = trim(eq == std::wstring::npos ? line : line.substr(0, eq));
+        if (!name.empty()) {
+            keys.push_back(narrow(name));
+        }
+    }
+    return keys;
 }
 
 // Trims a display name down to something that can follow a language name: the
@@ -218,6 +251,111 @@ void Catalog::load(const std::wstring& module_dir)
     }
     load_user_voices(personal_ini);
     settings_.merge_from(personal_ini);
+
+    // Last, so that everything above could still see the whole built-in table:
+    // a user voice takes its template from it, and a section naming a built-in
+    // is what keeps that built-in when the installer left it out.
+    apply_installed_selection(module_dir);
+}
+
+void Catalog::apply_installed_selection(const std::wstring& install_dir)
+{
+    // No file at all means no choice was ever recorded -- a build tree, or an
+    // installation made before the components page existed -- and everything
+    // stays. An empty [Voices] section is treated the same way and complained
+    // about, because a file that would silence the product is far more likely
+    // to be a mistake than an instruction.
+    std::vector<std::string> chosen;
+    const std::wstring path =
+        install_dir.empty() ? std::wstring() : install_dir + L"\\" + kInstalledIni;
+    if (!path.empty() && file_exists(path)) {
+        chosen = ini_section_keys(path, L"Voices");
+        if (chosen.empty()) {
+            IVX_WARN("catalog: %S names no voices; publishing all of them", path.c_str());
+        } else {
+            IVX_INFO("catalog: %S selects %u of the built-in voices", path.c_str(),
+                     static_cast<unsigned>(chosen.size()));
+        }
+    } else {
+        IVX_DEBUG("catalog: no installed.ini beside the module; every voice is published");
+    }
+
+    // A voice whose language rule file was never installed cannot speak, so it
+    // is left out as well: a name in the Windows voice list that fails the
+    // moment it is chosen is worse than one that was never offered. Only
+    // checked when the engine folder is actually found -- if it is not, an
+    // absent file cannot be told from an absent folder.
+    const std::wstring engine_dir = find_engine_dir();
+
+    auto rules_present = [&engine_dir](const Voice& v) {
+        if (engine_dir.empty()) {
+            return true;
+        }
+        const std::string* const names[] = {&v.language_file, &v.library_file};
+        for (const std::string* name : names) {
+            if (!name->empty() && !file_exists(engine_dir + L"\\" + widen(*name))) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto was_chosen = [&chosen](const Voice& v) {
+        if (chosen.empty()) {
+            return true;
+        }
+        for (const std::string& name : chosen) {
+            // The engine's name for it ("Danish Female") is what the installer
+            // writes; the name Windows shows ("Infovox Danish Female") is
+            // accepted too, so a file edited by hand works either way.
+            if (_stricmp(name.c_str(), v.mode_key.c_str()) == 0 ||
+                _stricmp(name.c_str(), v.display_name.c_str()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<Voice> kept;
+    kept.reserve(voices_.size());
+    int not_installed = 0;
+    int no_rules = 0;
+    for (Voice& v : voices_) {
+        if (v.user_defined) {
+            // A voice someone wrote down by hand is their own statement of
+            // intent and is never dropped by this. Say so in the log if the
+            // language it speaks was not installed, though, because that is
+            // exactly what "my own voice says nothing" will turn out to be.
+            if (!rules_present(v)) {
+                IVX_WARN("catalog: \"%s\" needs %s, which is not installed",
+                         v.display_name.c_str(), v.language_file.c_str());
+            }
+            kept.push_back(std::move(v));
+            continue;
+        }
+        if (!rules_present(v)) {
+            IVX_DEBUG("catalog: \"%s\" has no %s in %S", v.display_name.c_str(),
+                      v.language_file.c_str(), engine_dir.c_str());
+            ++no_rules;
+            continue;
+        }
+        if (!v.named_by_user && !was_chosen(v)) {
+            IVX_DEBUG("catalog: \"%s\" was not installed", v.display_name.c_str());
+            ++not_installed;
+            continue;
+        }
+        kept.push_back(std::move(v));
+    }
+    voices_ = std::move(kept);
+
+    if (not_installed > 0 || no_rules > 0) {
+        IVX_INFO("catalog: %d voices were not installed, %d have no rule file on disk; "
+                 "%u voices published",
+                 not_installed, no_rules, static_cast<unsigned>(voices_.size()));
+    }
+    if (voices_.empty()) {
+        IVX_ERROR("catalog: no voices at all; check %S and the engine folder", path.c_str());
+    }
 }
 
 void Catalog::load_user_voices(const std::wstring& ini_path)
@@ -268,6 +406,9 @@ void Catalog::load_user_voices(const std::wstring& ini_path)
             index = static_cast<int>(voices_.size()) - 1;
             ++added;
         } else {
+            // Naming a built-in is asking for it, which is how one the
+            // installer left out is put back.
+            voices_[static_cast<size_t>(index)].named_by_user = true;
             ++overridden;
         }
 

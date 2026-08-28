@@ -9,6 +9,9 @@ Languages: American English, British English, Danish, Dutch, Finnish, French,
 German, Icelandic, Italian, Norwegian, Castilian Spanish, Swedish.
 Speakers, in every language: Male, Female, Child, Giant, Zombie.
 
+You choose which of them to install; only the ones you chose are here. See
+"Choosing what is installed" below.
+
 
 Checking it works
 -----------------
@@ -24,6 +27,50 @@ Start menu, under "Infovox 230":
 
 If the voices do not appear in your program, close and reopen that program
 first: most programs read the voice list only once, when they start.
+
+
+Choosing what is installed
+--------------------------
+
+The installer's "Select components" page offers the twelve languages, and
+inside each language its five voices, one tick at a time. Nothing has to be
+taken as a job lot: American English Male on its own is a legitimate
+installation, and so is every voice of all twelve languages.
+
+Two things follow from a tick.
+
+A language carries its own pronunciation rules, and those are what take up
+room -- from 37 KB for Castilian Spanish to 6.7 MB for Danish, about 23 MB for
+all twelve. A language you do not tick is not put on the disk at all. The
+size of each is shown against it on that page.
+
+A voice costs nothing but a name in the Windows voice list, because the five
+speakers of a language differ only in four numbers and all five read the same
+rule file. Ticking a language takes all five of its voices; open it and untick
+the ones you do not want.
+
+There are three ready-made choices on the same page, and you can start from one
+and adjust it:
+
+  All 60 voices, in all 12 languages
+  The English voices only -- American and British, 10 voices
+  American English Male and Female only
+
+To change your mind later, run the installer again. It starts from what you
+chose last time, and a language you clear is removed from the disk and its
+voices from the Windows voice list.
+
+What you chose is written to installed.ini in this folder, which is how the
+speech interface knows which voices to publish. The file explains itself if you
+open it. Deleting it publishes every built-in voice again -- but a voice whose
+language was never installed has no rule file to speak from, so it would then
+be a name in the voice list that cannot speak. Running the installer again is
+the better way round.
+
+One exception, for when you want a single voice back without running the
+installer: a voice you name as a section in voices.ini is published whether or
+not installed.ini lists it, as long as its language is installed. Naming a
+voice is taken as asking for it. See "Adding your own voices by hand" below.
 
 
 How it is put together
@@ -190,6 +237,17 @@ change what you or your programs see.
 The same file's [Settings] section holds the engine-wide settings the utility's
 Engine settings page writes. voices.example.ini lists all of them.
 
+A section named after a built-in voice does two things: it changes that voice,
+and it asks for it. So if the installer left out, say, American English Child
+but you installed American English, adding
+
+  [Infovox American English Child]
+  Pitch = 92
+
+to voices.ini puts that voice back as well as raising its pitch. A section
+naming a voice whose language was never installed does nothing, because there
+is no rule file for it to speak from; install the language first.
+
 Logs
 ----
 
@@ -229,17 +287,22 @@ Diagnosing a problem
 Infovox230Diag.exe, in this folder, drives the engine two ways so a fault can be
 placed:
 
-  Infovox230Diag list                    every voice the product knows about
+  Infovox230Diag list                    every voice this installation has
   Infovox230Diag registry                confirms the engine reads no registry
   Infovox230Diag speak out.wav "text"    drives the engine directly
   Infovox230Diag worker out.wav "text"   drives it the way the speech interface
                                          does, through the background program
-  Infovox230Diag all outdir              one clip per voice, all sixty
+  Infovox230Diag all outdir              one clip per installed voice
   Infovox230Diag stop                    stops the background program
 
 If "speak" works but "worker" does not, the engine is fine and the problem is in
 the connection to the background program. If neither works, the log will say
 why. The 64-bit copies of these tools are in the x64 subfolder.
+
+"list" is also the quickest way to see what was installed: it prints the voices
+this installation actually has, which is what your programs will be offered. If
+a voice you expected is missing, the log says which of the two reasons it was --
+not chosen when you installed, or chosen but with its rule file absent.
 
 Infovox230SapiTest.exe goes through Windows speech itself, which is the last
 link in the chain:

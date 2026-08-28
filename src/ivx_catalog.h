@@ -14,6 +14,12 @@
 // speakers (Male, Female, Child, Giant, Zombie). The speakers differ only in
 // the four synthesis parameters Pitch, Dynamic, Aspiration and FormantNo, which
 // is why users can define their own: see load_user_voices().
+//
+// Not all sixty are necessarily present. The installer offers the languages and
+// the voices inside them one at a time and records what was chosen in
+// installed.ini beside the dll; apply_installed_selection() then leaves the
+// catalogue holding only those. The table is what the product CAN offer; the
+// catalogue is what this installation actually has.
 
 #include <string>
 #include <vector>
@@ -68,6 +74,11 @@ struct Voice {
     std::string formant_no;
     bool user_defined = false;
 
+    // A built-in that a voices.ini section names. Naming one is asking for it,
+    // which is how a voice the installer left out is put back without running
+    // the installer again. Never set on a voice that came only from the table.
+    bool named_by_user = false;
+
     // SAPI5 token attributes derived from the above.
     std::wstring sapi_name() const;
     std::wstring sapi_gender() const;
@@ -80,7 +91,8 @@ public:
     // Built-ins, then any user voices found in `voices.ini` next to the module
     // and in %LOCALAPPDATA%\Infovox230SAPI\voices.ini. A user entry whose
     // section name matches a built-in display name overrides that voice rather
-    // than adding another.
+    // than adding another. What the installer chose is applied last, so that
+    // what is left is what this installation can actually speak with.
     void load(const std::wstring& module_dir);
 
     const std::vector<Voice>& voices() const { return voices_; }
@@ -111,6 +123,12 @@ public:
 
 private:
     void load_user_voices(const std::wstring& ini_path);
+
+    // Reduces the built-ins to the ones the installer put there: the voices
+    // named in installed.ini, and only those whose language rule files are on
+    // disk. Runs last, so a user voice can still take any built-in as its
+    // template and a voices.ini section can still ask for one back.
+    void apply_installed_selection(const std::wstring& install_dir);
 
     std::vector<Voice> voices_;
     EngineSettings settings_;
